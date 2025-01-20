@@ -5,9 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include "request-handler.h"
 
 #define ROOT "/var/www/html"
@@ -171,4 +169,65 @@ void handle_requests(int client_socket)
         // Unsupported method
         send_response(client_socket, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
     }
+}
+
+int handle_requests_event_driven(connection_t *conn)
+{
+    int bytes_read; // data from single recv call
+
+    // non-blocking read loop
+    while ((bytes_read = recv(conn->fd, conn->buffer + conn->buf_len, sizeof(conn->buffer) - conn->buf_len - 1, MSG_DONTWAIT)) > 0)
+    {
+
+        conn->buf_len += bytes_read;
+        conn->buffer[conn->buf_len] = '\0';
+        printf("Received request:\n%s\n", conn->buffer);
+
+        // check if we have full req
+        char *headers_end = strstr(conn->buffer, "\r\n\r\n");
+
+        if (headers_end)
+        {
+            char method[8];
+            char path[1024];
+            sscanf(conn->buffer, "%s %s", method, path);
+
+            if (strcmp(method, "GET") == 0)
+            {
+                // save current flags
+                int flags = fcntl(conn->fd, F_GETFL, 0);
+                // disable non-blocking mode temporarily
+                fcntl(conn->fd, F_SETFL, flags & ~O_NONBLOCK);
+
+                handle_get(conn->fd, path);
+
+                // restore original flags
+                fcntl(conn->fd, F_SETFL, flags);
+            }
+            else if (strcmp(method, "PUT") == 0)
+            {
+                handle_put(conn->fd, path);
+            }
+            else
+            {
+                // Unsupported method
+                send_response(conn->fd, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
+            }
+
+            return CONN_CLOSED_OR_ERROR;
+        }
+    }
+
+    // if recv() returned 0 => client closed cleanly
+    if (bytes_read == 0)
+    {
+        return CONN_CLOSED_OR_ERROR;
+    }
+    // if recv() < 0 and errno is EAGAIN => no more data right now
+    if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+    {
+        return CONN_ALIVE; // wait for more data
+    }
+    // else => real error
+    return CONN_CLOSED_OR_ERROR;
 }
