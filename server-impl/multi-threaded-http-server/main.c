@@ -52,7 +52,7 @@ int main()
     }
 
     // LISTEN
-    if (listen(server_socket, 10) < 0)
+    if (listen(server_socket, 1024) < 0)
     {
         perror("Error listening on socket");
         return 1;

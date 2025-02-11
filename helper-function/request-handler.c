@@ -9,7 +9,6 @@
 #include "request-handler.h"
 
 #define ROOT "/var/www/html"
-#define ROOT2 "/var/www"
 #define BUFFER_SIZE 4096
 
 void send_response(int client_socket, const char *status, const char *content_type, const char *body)
@@ -103,15 +102,15 @@ void handle_put(int client_socket, const char *path)
     char buffer[BUFFER_SIZE];
     FILE *file;
 
-    // Check if the path starts with "/uploads"
-    if (strncmp(path, "/upload", 9) != 0)
+    // Check if the path starts with "/upload"
+    if (strncmp(path, "/upload", 7) != 0)
     {
         send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Invalid upload path.");
         return;
     }
 
-    // save the file under ROOT2/uploads/
-    snprintf(buffer, sizeof(buffer), "%s%s/s", ROOT2, path);
+    // save the file under ROOT/uploads/
+    snprintf(buffer, sizeof(buffer), "%s/uploads%s", ROOT, path + 7);
     printf("Trying to create file at: %s\n", buffer);
     file = fopen(buffer, "wb");
 
@@ -121,7 +120,7 @@ void handle_put(int client_socket, const char *path)
         send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error creating file.");
         return;
     }
-
+    
     // Read the body of the PUT request and write it to the file
     int bytes_read;
     while ((bytes_read = read(client_socket, buffer, sizeof(buffer))) > 0)
