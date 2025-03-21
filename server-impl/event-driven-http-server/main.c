@@ -64,7 +64,7 @@ int main()
         return 1;
     }
 
-    // Create the epoll instance (event bus/hub/controller)
+    // epoll instance
     epoll_fd = epoll_create1(0);
     if (epoll_fd == -1)
     {
@@ -73,7 +73,7 @@ int main()
         return 1;
     }
 
-    // add socket to the epoll instance
+    // adding sockets to epoll
     event.events = EPOLLIN;
     event.data.fd = server_socket;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket, &event) == -1)
@@ -101,15 +101,17 @@ int main()
 
         for (int i = 0; i < ready_events; i++)
         {
+            int fd = events[i].data.fd;
 
             // if current event is for server socket, accept connection
-            if (events[i].data.fd == server_socket)
+            if (fd == server_socket)
             {
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
-                int client_socket = accept(server_socket,
+                int client_socket = accept4(server_socket,
                                            (struct sockaddr *)&client_addr,
-                                           &client_len);
+                                           &client_len, SOCK_NONBLOCK);
+
                 if (client_socket < 0)
                 {
                     perror("Error accepting connection");
@@ -117,27 +119,35 @@ int main()
                 }
                 printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-                make_non_blocking(client_socket);
-
-                connection_t *conn = malloc(sizeof(connection_t));
+                // initializing connection state for client
+                conn_state *conn = malloc(sizeof(conn_state));
+                memset(conn, 0, sizeof(conn_state));
                 conn->fd = client_socket;
-                conn->buf_len = 0;
+                conn->state = READING_REQUEST;
 
-                event.events = EPOLLIN;
-                event.data.ptr = conn;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &event) == -1)
-                {
-                    perror("Error adding client socket to epoll");
-                    close(client_socket);
-                    continue;
-                }
+                // adding client socket to epoll to monitor read or write events
+                struct epoll_event client_event;
+                client_event.events = EPOLLIN | EPOLLET;
+                client_event.data.ptr = conn;
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event);
             }
             else
             {
-                connection_t *conn = (connection_t *)events[i].data.ptr;
+                conn_state *conn = (conn_state *)events[i].data.ptr;
                 int status = handle_requests_event_driven(conn);
+
+                // if network send buffer is full we pause the op
+                if (conn->state == HANDLING_GET)
+                {
+                    struct epoll_event ev;
+                    ev.events = EPOLLOUT | EPOLLET;
+                    ev.data.ptr = conn;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+                }
                 if (status == CONN_CLOSED_OR_ERROR)
                 {
+                    if (conn->file_fd != -1)
+                        close(conn->file_fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
                     close(conn->fd);
                     free(conn);

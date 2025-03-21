@@ -1,23 +1,33 @@
 #ifndef REQUEST_HANDLER_H
 #define REQUEST_HANDLER_H
 
-#define BUFFER_SIZE 4096
+#include <sys/types.h>
+#include <stddef.h>
+
+#define BUFFER_SIZE 65536 //64kb
 #define CONN_CLOSED_OR_ERROR 1
 #define CONN_ALIVE 0
 
-typedef struct {
-    int fd;
-    char buffer[BUFFER_SIZE];
-    int buf_len;
+typedef enum
+{
+    READING_HEADER,
+    HANDLING_GET,
+    HANDLING_POST
+} conn_state_enum;
 
-    int expected_body_length;
-    int received_body_length;
-    FILE *file;  // File handle for PUT uploads
-    int state;   // 0 = reading headers, 1 = reading body, 2 = sending response
-} connection_t;
+typedef struct
+{
+    int fd; // fd of client
+    char buffer[BUFFER_SIZE];
+    size_t bytes_read; // of the request
+    off_t file_size;   // total file size
+    int file_fd;       // fd of file to send or of being written
+    off_t byte_offset; // offset in file (read or write)
+    conn_state_enum state;
+} conn_state;
 
 void handle_requests(int client_socket);
-int handle_requests_event_driven(connection_t *conn);
+int handle_requests_event_driven(conn_state *conn);
 void handle_get(int client_socket, const char *path);
 void handle_put(int client_socket, const char *path, int content_length, const char *initial_body, int initial_body_length);
 
