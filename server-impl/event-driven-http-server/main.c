@@ -122,12 +122,20 @@ int main()
                 // initializing connection state for client
                 conn_state *conn = malloc(sizeof(conn_state));
                 memset(conn, 0, sizeof(conn_state));
+                if (posix_memalign((void **)&conn->buffer, BLOCK_SIZE, BUFFER_SIZE) != 0)
+                {
+                    perror("Failed to allocate aligned buffer");
+                    free(conn);
+                    close(client_socket);
+                    continue;
+                }
                 conn->fd = client_socket;
-                conn->state = READING_REQUEST;
+                conn->file_fd = -1;
+                conn->state = READING_HEADER;
 
                 // adding client socket to epoll to monitor read or write events
                 struct epoll_event client_event;
-                client_event.events = EPOLLIN | EPOLLET;
+                client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
                 client_event.data.ptr = conn;
                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event);
             }
@@ -135,21 +143,35 @@ int main()
             {
                 conn_state *conn = (conn_state *)events[i].data.ptr;
                 int status = handle_requests_event_driven(conn);
-
-                // if network send buffer is full we pause the op
-                if (conn->state == HANDLING_GET)
+                /*
+                                if (conn->state == HANDLING_GET)
+                                {
+                                    struct epoll_event ev;
+                                    ev.events = EPOLLOUT | EPOLLET;
+                                    ev.data.ptr = conn;
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+                                }
+                                */
+                uint32_t events = 0;
+                if (status == CONN_ALIVE)
                 {
-                    struct epoll_event ev;
-                    ev.events = EPOLLOUT | EPOLLET;
-                    ev.data.ptr = conn;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+                    if (conn->state == HANDLING_GET)
+                        events = EPOLLOUT;
+                    else if (conn->state == HANDLING_POST)
+                        events = EPOLLIN; // Keep reading PUT body
+                    else
+                        events = EPOLLIN;
+                    events |= EPOLLET ;
                 }
+                struct epoll_event ev = {.events = events, .data.ptr = conn};
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
                 if (status == CONN_CLOSED_OR_ERROR)
                 {
                     if (conn->file_fd != -1)
                         close(conn->file_fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
                     close(conn->fd);
+                    free(conn->buffer);
                     free(conn);
                 }
             }
