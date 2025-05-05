@@ -1,21 +1,33 @@
 #ifndef REQUEST_HANDLER_H
 #define REQUEST_HANDLER_H
 
-#include <unistd.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <stddef.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
+#include <stdio.h>  // for io
+#include <stdlib.h> // for std lib
+#include <string.h> // for str manipulation
 
-#include <liburing.h>
+#include <unistd.h>    // for sys calls
+#include <errno.h>     // for erros
+#include <sys/types.h> // for sys  call data types
+#include <stddef.h>    // for standard data types
+#include <stdint.h>    // for fix width int types
 
+#include <sys/socket.h> // for socket api func
+#include <netinet/in.h> // for internet protocol def
+#include <arpa/inet.h>  // for ip manipulation
+
+#include <fcntl.h>    // for file control options
+#include <sys/stat.h> // to get file stats
+#include <sys/mman.h> // for memory alignment
+#include <liburing.h> // uring
+
+#define SERVER_PORT 8083
+#define ACCEPT_BACKLOG 4096
 #define BUFFER_SIZE 64 * 1024 // 64kb or 16 blocks on (hardware)
-#define MY_BLOCK_SIZE 4096
+#define BLOCK_SIZE 4096
 #define ROOT "/var/www/html"
 
+#define CONN_CLOSED 1
+#define CONN_ERROR -1
 #define CONN_CLOSED_OR_ERROR 1
 #define CONN_ALIVE 0
 
