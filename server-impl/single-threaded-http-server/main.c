@@ -49,8 +49,22 @@ int main()
 
         // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-        handle_blocking_requests(client_socket);
-
+        int file_fd;
+        char *req_buffer;
+        if (posix_memalign((void **)&req_buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
+        {
+            perror("Failed to allocate aligned buffer");
+            close(client_socket);
+            continue;
+        }
+        memset(req_buffer, 0, BUFFER_SIZE);
+        int res = handle_blocking_requests(client_socket, &file_fd, req_buffer);
+        if (res == CONN_ERROR)
+        {
+            send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Internal Server Error");
+        }
+        close(file_fd);
+        free(req_buffer);
         close(client_socket);
     }
 

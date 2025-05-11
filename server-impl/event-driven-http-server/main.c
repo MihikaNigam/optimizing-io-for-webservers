@@ -1,18 +1,9 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include "request-handler.h"
 
-#include <sys/epoll.h>
 #include <fcntl.h>
+#include <sys/epoll.h>
 
-#define SERVER_PORT 8083
-#define MAX_EVENTS 10
+#define MAX_EVENTS 40
 
 void make_non_blocking(int socket_fd)
 {
@@ -31,8 +22,9 @@ void make_non_blocking(int socket_fd)
 
 int main()
 {
-    int server_socket, epoll_fd;
-    struct sockaddr_in server_addr;
+    int server_socket, client_socket, epoll_fd;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
     struct epoll_event event, events[MAX_EVENTS];
 
     // CREATE
@@ -45,7 +37,7 @@ int main()
     // make the server socket non-blocking
     make_non_blocking(server_socket);
 
-    // BIND
+    // CONFIGURE & BIND
     memset(&server_addr, 0, sizeof(server_addr)); // Zero out the structure
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
@@ -58,7 +50,7 @@ int main()
     }
 
     // LISTEN
-    if (listen(server_socket, 1024) < 0)
+    if (listen(server_socket, ACCEPT_BACKLOG) < 0)
     {
         perror("Error listening on socket");
         return 1;
@@ -106,23 +98,21 @@ int main()
             // if current event is for server socket, accept connection
             if (fd == server_socket)
             {
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int client_socket = accept4(server_socket,
-                                           (struct sockaddr *)&client_addr,
-                                           &client_len, SOCK_NONBLOCK);
+                client_socket = accept4(server_socket,
+                                        (struct sockaddr *)&client_addr,
+                                        &client_len, SOCK_NONBLOCK);
 
                 if (client_socket < 0)
                 {
                     perror("Error accepting connection");
                     continue;
                 }
-                printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+                // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
                 // initializing connection state for client
                 conn_state *conn = malloc(sizeof(conn_state));
                 memset(conn, 0, sizeof(conn_state));
-                if (posix_memalign((void **)&conn->buffer, BLOCK_SIZE, BUFFER_SIZE) != 0)
+                if (posix_memalign((void **)&conn->req_buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
                 {
                     perror("Failed to allocate aligned buffer");
                     free(conn);
@@ -135,25 +125,17 @@ int main()
 
                 // adding client socket to epoll to monitor read or write events
                 struct epoll_event client_event;
-                client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                client_event.events = EPOLLIN | EPOLLET;
                 client_event.data.ptr = conn;
                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event);
             }
             else
             {
                 conn_state *conn = (conn_state *)events[i].data.ptr;
-                int status = handle_requests_event_driven(conn);
-                /*
-                                if (conn->state == HANDLING_GET)
-                                {
-                                    struct epoll_event ev;
-                                    ev.events = EPOLLOUT | EPOLLET;
-                                    ev.data.ptr = conn;
-                                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-                                }
-                                */
+                int res = handle_requests_event_driven(conn);
+
                 uint32_t events = 0;
-                if (status == CONN_ALIVE)
+                if (res == CONN_ALIVE)
                 {
                     if (conn->state == HANDLING_GET)
                         events = EPOLLOUT;
@@ -161,17 +143,21 @@ int main()
                         events = EPOLLIN; // Keep reading PUT body
                     else
                         events = EPOLLIN;
-                    events |= EPOLLET ;
+                    events |= EPOLLET;
                 }
                 struct epoll_event ev = {.events = events, .data.ptr = conn};
                 epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-                if (status == CONN_CLOSED_OR_ERROR)
+                if (res == CONN_CLOSED || res == CONN_ERROR)
                 {
-                    if (conn->file_fd != -1)
-                        close(conn->file_fd);
+                    if (res == CONN_ERROR)
+                    {
+                        send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Internal Server Error");
+                    }
+
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+                    close(conn->file_fd);
                     close(conn->fd);
-                    free(conn->buffer);
+                    free(conn->req_buffer);
                     free(conn);
                 }
             }

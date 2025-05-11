@@ -1,18 +1,8 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <fcntl.h>
-#include <errno.h>
-
 #include "request-handler.h"
 
-#define SERVER_PORT 8083
-#define QUEUE_DEPTH 32
+#include <fcntl.h>
+
+#define QUEUE_DEPTH 40
 
 void make_non_blocking(int socket_fd)
 {
@@ -29,37 +19,56 @@ void make_non_blocking(int socket_fd)
     }
 }
 
-void submit_accept(struct io_uring *ring, int server_fd)
+int add_accept_request(int server_socket, struct io_uring *ring, struct sockaddr_in *client_addr,
+                       socklen_t *client_len)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe)
     {
         perror("failed to fetch sqe in submit_accept");
-        return;
+        return -1;
     }
+    io_uring_prep_accept(sqe, server_socket, (struct sockaddr *)client_addr,
+                         client_len, SOCK_NONBLOCK);
 
-    // initialize new conn
-    conn_state *conn = calloc(1, sizeof(conn_state));
-    if (posix_memalign((void **)&conn->buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
+    // initializing connection state for client
+    conn_state *conn = malloc(sizeof(conn_state));
+    memset(conn, 0, sizeof(conn_state));
+    if (posix_memalign((void **)&conn->req_buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
     {
         perror("Failed to allocate aligned buffer");
         free(conn);
-        return;
+        return -1;
     }
-    conn->fd = -1;
+    memset(conn->req_buffer, 0, BUFFER_SIZE);
     conn->file_fd = -1;
-    conn->client_len = sizeof(conn->client_addr);
-    conn->state = READING_HEADER;
+    conn->state = ACCEPTING_CONNECTION;
 
-    io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)&conn->client_addr, &conn->client_len, SOCK_NONBLOCK);
     io_uring_sqe_set_data(sqe, conn);
+    io_uring_submit(ring);
+    return 0;
+}
+
+void close_conn(conn_state *conn)
+{
+    if (!conn)
+        return;
+    if (conn->file_fd != -1)
+        close(conn->file_fd);
+    if (conn->fd != -1)
+        close(conn->fd);
+    if (conn->req_buffer)
+        free(conn->req_buffer);
+    free(conn);
 }
 
 int main()
 {
     int server_socket;
     struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
     struct io_uring ring;
+    struct io_uring_cqe *cqe;
 
     // CREATE
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -85,7 +94,7 @@ int main()
     }
 
     // LISTEN
-    if (listen(server_socket, 1024) < 0)
+    if (listen(server_socket, ACCEPT_BACKLOG) < 0)
     {
         perror("Error listening on socket");
         return 1;
@@ -99,69 +108,81 @@ int main()
         exit(1);
         return 1;
     }
-    printf("io_uring initialized\n");
 
     printf("Server listening on PORT %d\n", SERVER_PORT);
 
     // ALLOW
     // 1st connection req
-    submit_accept(&ring, server_socket);
-    io_uring_submit(&ring);
+    if (add_accept_request(server_socket, &ring, &client_addr, &client_len) < 0)
+    {
+        perror("Error accepting 1st connection");
+        close(server_socket);
+        exit(1);
+        return 1;
+    }
 
     while (1)
     {
-        struct io_uring_cqe *cqe;
-        // wait until an event happens
         int ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0)
         {
-            if (errno == EINTR)
+            if (errno == -EINTR)
                 continue;
-            perror("io_uring_wait_cqe");
+            perror("Error in uring_wait_cqe");
             break;
         }
         conn_state *conn = (conn_state *)io_uring_cqe_get_data(cqe);
-        if (!conn)
-        {
-            perror("Null connection state in completion");
-            io_uring_cqe_seen(&ring, cqe);
-            continue;
-        }
+        ssize_t res = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
 
-        int res = cqe->res;
+        if (!conn)
+            continue;
 
         if (res < 0)
         {
-            // perror("Error accepting connection");
-            free(conn->buffer);
-            free(conn);
-            submit_accept(&ring, server_socket);
-            io_uring_submit(&ring);
-            // continue;
-        }
-        else if (conn->fd == -1)
-        {
-            conn->fd = res;
-            // connection succeeded
-            printf("Connection accepted from %s:%d\n", inet_ntoa(conn->client_addr.sin_addr), ntohs(conn->client_addr.sin_port));
-            io_uring_func(&ring, conn, READ_REQUEST);
-            conn->last_op = OP_READ;
+            if (res == -EAGAIN || res == -EWOULDBLOCK)
+                continue;
 
-            // re-arm
-            submit_accept(&ring, server_socket);
+            fprintf(stderr, "Async request failed: %s for state: %d\n",
+                    strerror(-cqe->res), conn->state);
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+            close_conn(conn);
+        }
+        else if (res == 0)
+        {
+            fprintf(stderr, "Client disconnected: %s for state: %d\n",
+                    strerror(-cqe->res), conn->state);
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+            close_conn(conn);
         }
         else
         {
-            // existing connection
-            int status = handle_requests_uring(&ring, cqe);
-            if (status == CONN_CLOSED_OR_ERROR)
+            // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+
+            if (conn->state == ACCEPTING_CONNECTION)
             {
-                submit_close(&ring, conn);
+                conn->fd = res;
+                conn->state = READING_HEADER;
+                conn->last_op = OP_READ;
+                io_uring_func(&ring, conn, RECV_REQUEST);
+
+                if (add_accept_request(server_socket, &ring, &client_addr, &client_len) < 0)
+                    continue;
+            }
+            else
+            {
+                // existing connection
+                int status = handle_requests_uring(&ring, conn, res);
+                if (status == CONN_CLOSED || status == CONN_ERROR)
+                {
+                    if (status == CONN_ERROR)
+                    {
+                        send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Internal Server Error");
+                    }
+                    close_conn(conn);
+                }
             }
         }
-
-        io_uring_cqe_seen(&ring, cqe);
-        io_uring_submit(&ring);
     }
 
     io_uring_queue_exit(&ring);

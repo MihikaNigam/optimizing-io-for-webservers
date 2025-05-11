@@ -1,26 +1,5 @@
 // request_handler.c
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include "request-handler.h"
-
-#include <sys/sendfile.h>
-
-#include <malloc.h>   // for memalign
-#include <sys/mman.h> // for memory alignment
-
-void *allocate_aligned_buffer(size_t size)
-{
-    void *ptr;
-    if (posix_memalign(&ptr, BLOCK_SIZE, size) != 0)
-    {
-        return NULL;
-    }
-    return ptr;
-}
 
 off_t get_file_size(int fd)
 {
@@ -35,7 +14,7 @@ off_t get_file_size(int fd)
 // round down to block size
 size_t align_to_block(size_t size)
 {
-    return (size / BLOCK_SIZE) * BLOCK_SIZE;
+    return ((size - 1) / MY_BLOCK_SIZE + 1) * MY_BLOCK_SIZE;
 }
 
 void send_response(int client_socket, const char *status, const char *content_type, const char *body)
@@ -78,282 +57,298 @@ const char *get_mime_type(const char *path)
         return "application/octet-stream"; // Default for unknown types
 }
 
-void handle_get(int client_socket, const char *path)
+int handle_get_header(int client_socket, char *path, int *file_fd,
+                      off_t *file_size)
 {
-    char full_path[1024];
-    int file_fd;
-    snprintf(full_path, sizeof(full_path), "%s%s", ROOT, path);
+    char full_path[2048];
 
-    // Check if the path is just "/"
+    // check if the path is just "/"
+    snprintf(full_path, sizeof(full_path), "%s%s", ROOT, path);
     if (strcmp(path, "/") == 0)
     {
         snprintf(full_path, sizeof(full_path), "%s/server-index.html", ROOT);
     }
 
-    file_fd = open(full_path, O_RDONLY | O_DIRECT);
-    if (file_fd == -1)
+    // open w O_DIRECT
+    *file_fd = open(full_path, O_RDONLY | O_DIRECT);
+    if (*file_fd == -1)
     {
-        send_response(client_socket, "HTTP/1.1 404 Not Found", "text/plain", "File not found.");
-        return;
+        send_response(client_socket, "HTTP/1.1 404 Not Found", "text/plain", "File not found");
+        return CONN_CLOSED;
     }
 
-    // Determine the file size
-    // fseek(file, 0, SEEK_END);
-    // long file_size = ftell(file);
-    // rewind(file);
-    off_t file_size = get_file_size(file_fd);
-    if (file_size == -1)
+    // get file size
+    *file_size = get_file_size(*file_fd);
+    if (*file_size == -1)
     {
-        close(file_fd);
+        perror("Couldnt get file size");
         send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Could not get file size.");
-        return;
+        return CONN_ERROR;
     }
 
-    // Get the MIME type
+    // get the MIME type
     const char *mime_type = get_mime_type(full_path);
     printf("mime_type is: %s\n", mime_type);
 
-    // Construct and send the HTTP header
+    // construct and send the HTTP header
     char header[BUFFER_SIZE];
     snprintf(header, sizeof(header),
              "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n\r\n",
-             mime_type, file_size);
+             mime_type, *file_size);
     send(client_socket, header, strlen(header), 0);
-
-    // Allocate aligned buffer
-    char *buffer = allocate_aligned_buffer(BUFFER_SIZE);
-    if (!buffer)
-    {
-        close(file_fd);
-        send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Memory allocation failed.");
-        return;
-    }
-
-    off_t remaining = file_size;
-    while (remaining > 0)
-    {
-        size_t to_read = (remaining > BUFFER_SIZE) ? BUFFER_SIZE : remaining;
-        to_read = align_to_block(to_read); // Ensure aligned size
-        if (to_read == 0)
-            to_read = BLOCK_SIZE; // Handle very small files
-
-        ssize_t bytes_read = read(file_fd, buffer, to_read);
-        if (bytes_read == -1)
-        {
-            perror("Error reading file");
-            break;
-        }
-
-        ssize_t sent = send(client_socket, buffer, bytes_read, 0);
-        if (sent == -1)
-        {
-            perror("Error sending data");
-            break;
-        }
-
-        remaining -= bytes_read;
-    }
-
-    free(buffer);
-    close(file_fd);
+    return CONN_ALIVE;
 }
 
-void handle_put(int client_socket, const char *path, int content_length, const char *initial_body, int initial_body_length)
+int handle_put_header(int client_socket, char *path, int *file_fd,
+                      off_t *file_size, char *req_buffer)
 {
-    // char buffer[BUFFER_SIZE];
     char file_path[2048];
-    int file_fd;
 
     // Check if the path starts with "/upload"
     if (strncmp(path, "/upload", 7) != 0)
     {
         send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Invalid upload path.");
-        return;
+        return CONN_CLOSED;
     }
+
+    // get content length
+    char *cl_header = strstr(req_buffer, "Content-Length: ");
+    if (!cl_header)
+    {
+        send_response(client_socket, "HTTP/1.1 411 Length Required", "text/plain", "Content-Length required.");
+        return CONN_CLOSED;
+    }
+    sscanf(cl_header, "Content-Length: %ld", file_size);
 
     // constructing file path under ROOT/uploads/
     snprintf(file_path, sizeof(file_path), "%s/uploads%s", ROOT, path + 7);
     printf("Trying to create file at: %s\n", file_path);
 
     // open file for writing
-    file_fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
-    if (file_fd == -1)
+    *file_fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    if (*file_fd == -1)
     {
         perror("Error creating file");
-        send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error creating file.");
-        return;
+        return CONN_ERROR;
     }
 
-    // allocate aligned buffer
-    char *aligned_buf = allocate_aligned_buffer(BUFFER_SIZE);
-    if (!aligned_buf)
-    {
-        close(file_fd);
-        send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Memory allocation failed.");
-        return;
-    }
-
-    // write initial body data if present
-    int total_received = 0;
-
-    if (initial_body && initial_body_length > 0)
-    {
-        // Copy to aligned buffer in chunks
-        const char *src = initial_body;
-        size_t remaining = initial_body_length;
-
-        while (remaining > 0)
-        {
-            size_t chunk = (remaining > BUFFER_SIZE) ? BUFFER_SIZE : remaining;
-            size_t copy_size = chunk;
-
-            // For the last chunk that might need padding
-            if (chunk < BLOCK_SIZE && remaining == chunk)
-            {
-                memset(aligned_buf, 0, BLOCK_SIZE); // Zero out the block first
-                copy_size = chunk;                  // Only copy actual data
-            }
-
-            memcpy(aligned_buf, src, copy_size);
-
-            size_t to_write = align_to_block(chunk);
-            if (to_write == 0)
-                to_write = BLOCK_SIZE;
-
-            ssize_t written = write(file_fd, aligned_buf, to_write);
-            if (written == -1)
-            {
-                perror("Error writing initial data");
-                free(aligned_buf);
-                close(file_fd);
-                send_response(client_socket, "HTTP/1.1 500 Internal Server Error",
-                              "text/plain", "Error writing to file.");
-                return;
-            }
-
-            total_received += chunk;
-            src += chunk;
-            remaining -= chunk;
-        }
-    }
-
-    // Read remaining data
-    int remaining = content_length - total_received;
-    while (remaining > 0)
-    {
-        size_t to_read = (remaining > BUFFER_SIZE) ? BUFFER_SIZE : remaining;
-        // Don't align reads - we'll handle alignment in the write
-        ssize_t bytes_read = read(client_socket, aligned_buf, to_read);
-        if (bytes_read <= 0)
-        {
-            perror("Error reading from client");
-            break;
-        }
-
-        // Handle partial block at end of transfer
-        if (bytes_read < BLOCK_SIZE &&
-            (total_received + bytes_read) == content_length)
-        {
-            memset(aligned_buf + bytes_read, 0, BLOCK_SIZE - bytes_read);
-            size_t to_write = BLOCK_SIZE;
-
-            if (write(file_fd, aligned_buf, to_write) == -1)
-            {
-                perror("Error writing final block");
-                break;
-            }
-        }
-        else
-        {
-            // Normal aligned write
-            size_t to_write = align_to_block(bytes_read);
-            if (to_write == 0)
-                to_write = BLOCK_SIZE;
-
-            if (write(file_fd, aligned_buf, to_write) == -1)
-            {
-                perror("Error writing to file");
-                break;
-            }
-        }
-
-        total_received += bytes_read;
-        remaining -= bytes_read;
-    }
-
-    free(aligned_buf);
-    close(file_fd);
-
-    // verify if all data was received
-    if (total_received == content_length)
-    {
-        // fsync(file_fd);
-        send_response(client_socket, "HTTP/1.1 200 OK", "text/plain", "File uploaded successfully.");
-    }
-    else
-    {
-        send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "File upload incomplete.");
-    }
+    return CONN_ALIVE;
 }
 
-void handle_requests(int client_socket)
+ssize_t send_fully(int fd, const void *buf, size_t to_send, server_type s_type)
 {
-    char req_buffer[BUFFER_SIZE];
-    int bytes_read;
-
-    // Read incoming request
-    bytes_read = read(client_socket, req_buffer, sizeof(req_buffer) - 1);
-    if (bytes_read < 0)
+    ssize_t sent = 0;
+    while (sent < to_send)
     {
-        perror("Error reading request");
-        return;
-    }
-
-    req_buffer[bytes_read] = '\0'; // Null-terminate the request string
-    // printf("Received request:\n%s\n", req_buffer);
-
-    // Extract method and path from the request string
-    char method[8];
-    char path[1024];
-    sscanf(req_buffer, "%s %s", method, path);
-    printf("Received request:\n%s %s\n", method, path);
-
-    // Handle GET method
-    if (strcmp(method, "GET") == 0)
-    {
-        handle_get(client_socket, path);
-    }
-    // Handle PUT method
-    else if (strcmp(method, "PUT") == 0)
-    {
-        char *cl_header = strstr(req_buffer, "Content-Length: ");
-        if (!cl_header)
+        ssize_t n = send(fd, (char *)buf + sent, to_send - sent, 0);
+        if (n == -1)
         {
-            send_response(client_socket, "HTTP/1.1 411 Length Required", "text/plain", "Content-Length required.");
-            return;
+            if (errno == EINTR)
+            {
+                continue; // Retry
+            }
+            // for eagain and ewouldblock
+            if (s_type == NON_BLOCKING && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return sent;
+            return -1; // Real error
         }
-        int content_length = atoi(cl_header + strlen("Content-Length: "));
-        char *body_start = strstr(req_buffer, "\r\n\r\n");
-        if (!body_start)
-        {
-            send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed headers.");
-            return;
-        }
-        body_start += 4; // Skip CRLFCRLF
-        int initial_body_length = bytes_read - (body_start - req_buffer);
-        if (initial_body_length < 0)
-            initial_body_length = 0;
-        if (initial_body_length > content_length)
-            initial_body_length = content_length;
+        sent += n;
+    }
+    return sent;
+}
 
-        handle_put(client_socket, path, content_length, body_start, initial_body_length);
-        // handle_put(client_socket, path);
-    }
-    else
+ssize_t write_fully(int fd, const void *buf, size_t to_write, server_type s_type)
+{
+    ssize_t written = 0;
+    to_write = align_to_block(to_write);
+    while (written < to_write)
     {
-        // Unsupported method
-        send_response(client_socket, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
+        ssize_t n = write(fd, (char *)buf + written, to_write - written);
+        if (n == -1)
+        {
+            if (errno == EINTR)
+            {
+                continue; // Retry
+            }
+            // for eagain and ewouldblock
+            if (s_type == NON_BLOCKING && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return written;
+            perror("Couldnt write: \n");
+            return -1; // Real error
+        }
+        written += n;
     }
+    return written;
+}
+
+int handle_blocking_requests(int client_socket, int *file_fd, char *req_buffer)
+{
+    off_t file_size;
+    char method[8], path[1024];
+    ssize_t n;
+
+    // read incoming request
+    n = recv(client_socket, req_buffer, BUFFER_SIZE, 0);
+    if (n < 0)
+    {
+        perror("Client stopped sending");
+        send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+        return CONN_CLOSED;
+    }
+    if (n == 0)
+    {
+        perror("Client disconnected");
+        send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+        return CONN_CLOSED;
+    }
+
+    // if we have full header request
+    if (strstr(req_buffer, "\r\n\r\n"))
+    {
+
+        // extract method and path from the request string
+        sscanf(req_buffer, "%s %s", method, path);
+        printf("Received request:\n%s %s\n", method, path);
+
+        // Handle GET method
+        if (strcmp(method, "GET") == 0)
+        {
+            int res = handle_get_header(client_socket, path, &file_fd,
+                                        &file_size);
+            if (res == CONN_ERROR)
+            {
+                perror("error completing get_header");
+                return CONN_ERROR;
+            }
+            else if (res == CONN_CLOSED)
+            {
+                perror("issue in client's req");
+                return CONN_CLOSED;
+            }
+
+            memset(req_buffer, 0, BUFFER_SIZE); // use the req_buffer as send buffer
+            off_t byte_offset = 0;
+            while (byte_offset < file_size)
+            {
+                size_t remaining = file_size - byte_offset;
+                ssize_t bytes_read = pread(*file_fd, req_buffer, BUFFER_SIZE, byte_offset);
+                if (bytes_read == -1)
+                {
+                    perror("PREAD FAILED in GET ");
+                    return CONN_ERROR;
+                }
+
+                ssize_t sent = send_fully(client_socket, req_buffer, bytes_read, BLOCKING);
+                if (sent == -1)
+                {
+                    perror("Error sending blocking data");
+                    return CONN_ERROR;
+                }
+                printf("bytes_read=%zd, sent=%zd, file_size=%zd \n", bytes_read, sent, file_size);
+                byte_offset += sent;
+            }
+            return CONN_CLOSED;
+        }
+        // Handle PUT method
+        else if (strcmp(method, "PUT") == 0)
+        {
+            char *body_start = strstr(req_buffer, "\r\n\r\n");
+            if (!body_start)
+            {
+                send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed headers.");
+                return CONN_CLOSED;
+            }
+            int res = handle_put_header(client_socket, path, file_fd, &file_size, req_buffer);
+            if (res == CONN_ERROR)
+            {
+                perror("error completing put_header");
+                return CONN_ERROR;
+            }
+            else if (res == CONN_CLOSED)
+            {
+                perror("issue in client's req");
+                return CONN_CLOSED;
+            }
+            body_start += 4; // Skip past the "\r\n\r\n"
+            size_t initial_body_len = n - (body_start - req_buffer);
+            if (initial_body_len < 0)
+                initial_body_len = 0;
+            off_t byte_offset = 0;
+            if (initial_body_len > 0)
+            {
+                // move the content to the start
+                memmove(req_buffer, body_start, initial_body_len);
+
+                if (initial_body_len >= file_size)
+                {
+                    ssize_t written = write_fully(*file_fd, req_buffer, BUFFER_SIZE, BLOCKING);
+                    if (written == -1)
+                        return CONN_ERROR;
+                    byte_offset += written;
+
+                    if (byte_offset >= file_size)
+                    {
+                        send_response(client_socket, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
+                        return CONN_CLOSED;
+                    }
+                    return CONN_ERROR;
+                }
+                else
+                {
+                    // set rest values as 0
+                    memset(req_buffer + initial_body_len, 0, BUFFER_SIZE - initial_body_len);
+                }
+            }
+            size_t bytes_read = initial_body_len;
+            printf("bytes_read=%zd, byte_offset=%zd, file_size=%zd \n", bytes_read, byte_offset, file_size);
+            while (byte_offset < file_size)
+            {
+                size_t bytes_recvd = recv(client_socket, req_buffer + bytes_read, BUFFER_SIZE - bytes_read, 0);
+                bytes_read += bytes_recvd;
+                if (bytes_recvd < 0)
+                {
+                    perror("Client stopped sending");
+                    send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+                    return CONN_CLOSED;
+                }
+                if (bytes_recvd == 0)
+                {
+                    perror("Client disconnected");
+                    send_response(client_socket, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+                    return CONN_CLOSED;
+                }
+                if (bytes_read < BUFFER_SIZE)
+                {
+                    memset(req_buffer + bytes_read, 0, BUFFER_SIZE - bytes_read);
+                    if (byte_offset + bytes_read < file_size)
+                    {
+                        continue;
+                    }
+                }
+
+                ssize_t written = write_fully(*file_fd, req_buffer, BUFFER_SIZE, BLOCKING);
+                if (written == -1)
+                    return CONN_ERROR;
+                byte_offset += written;
+                printf("bytes_recvd=%zd, bytes_read=%zd, byte_offset=%zd, file_size=%zd \n", bytes_recvd, bytes_read, byte_offset, file_size);
+                bytes_read = 0;
+            }
+            if (byte_offset >= file_size)
+            {
+                send_response(client_socket, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
+                return CONN_CLOSED;
+            }
+            return CONN_ERROR;
+        }
+
+        else
+        {
+            // Unsupported method
+            send_response(client_socket, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
+            return CONN_CLOSED;
+        }
+    }
+    return CONN_CLOSED;
 }
 
 int verify_alignment(conn_state *conn)
@@ -362,7 +357,7 @@ int verify_alignment(conn_state *conn)
     if ((uintptr_t)conn->buffer % BLOCK_SIZE != 0)
     {
         perror("Error: Buffer not aligned to block size ");
-        return CONN_CLOSED_OR_ERROR;
+        return CONN_ERROR;
     }
 
     // verify offset alignment
@@ -370,892 +365,414 @@ int verify_alignment(conn_state *conn)
     {
         fprintf(stderr, "Error: Offset %ld not aligned to block size %d\n",
                 conn->byte_offset, BLOCK_SIZE);
-        return CONN_CLOSED_OR_ERROR;
+        return CONN_ERROR;
     }
     return 2;
 }
 
-int handle_partial_with_padding(conn_state *conn)
-{
-    size_t remaining = conn->file_size - conn->byte_offset;
-    // printf("File Size= %ld, offset= %ld, remaining= %zu\n", conn->file_size, conn->byte_offset, remaining);
-
-    const size_t padding_needed = BLOCK_SIZE - remaining;
-
-    if (verify_alignment(conn) != 2)
-    {
-        return CONN_CLOSED_OR_ERROR;
-    }
-
-    ssize_t bytes_read = pread(conn->file_fd, conn->buffer, BLOCK_SIZE, conn->byte_offset);
-    if (bytes_read == -1)
-    {
-        printf("Read failed at offset %ld \n", conn->byte_offset);
-        perror("PREAD FAILED: ");
-        return CONN_CLOSED_OR_ERROR;
-    }
-
-    // get the actual data from padded
-    size_t real_bytes = BLOCK_SIZE - padding_needed; // bytes_read > remaining ? remaining : bytes_read;
-
-    printf("real_bytes= %zd, bytes_read= %zd, actual_bytes_left_tosend= %zd\n", real_bytes, bytes_read, remaining);
-
-    ssize_t sent = send(conn->fd, conn->buffer, real_bytes, 0);
-    if (sent == -1)
-    {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-            return CONN_ALIVE;
-        }
-        perror("Error sending data");
-        return CONN_CLOSED_OR_ERROR;
-    }
-    conn->byte_offset += real_bytes;
-    if (conn->byte_offset >= conn->file_size)
-    {
-        close(conn->file_fd);
-        printf("PARTIALFILE SENT SUCCESSFULLY\n");
-        return CONN_CLOSED_OR_ERROR;
-    }
-    return CONN_ALIVE;
-}
-
-ssize_t write_fully(int fd, const void *buf, size_t count)
-{
-    ssize_t written = 0;
-    while (written < count)
-    {
-        ssize_t n = write(fd, (char *)buf + written, count - written);
-        if (n == -1)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                continue; // Retry on non-blocking
-            }
-            perror("Error in writing");
-            return -1; // Real error
-        }
-        written += n;
-    }
-    return written;
-}
 int handle_requests_event_driven(conn_state *conn)
 {
-
-    ssize_t n;
     char method[16], path[1024];
-    char full_path[2048];
+    ssize_t n;
 
     if (conn->state == READING_HEADER)
     {
-        n = recv(conn->fd, conn->header_buffer + conn->bytes_read, BUFFER_SIZE - conn->bytes_read, 0);
+        n = recv(conn->fd, conn->req_buffer + conn->bytes_read, BUFFER_SIZE - conn->bytes_read, 0);
 
         if (n < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return CONN_ALIVE;
-            return CONN_CLOSED_OR_ERROR;
+            perror("Client stopped sending");
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+            return CONN_CLOSED;
         }
         else if (n == 0)
         {
-            return CONN_CLOSED_OR_ERROR;
+            perror("Client disconnected");
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+            return CONN_CLOSED;
         }
         conn->bytes_read += n;
-        // conn->header_buffer[conn->bytes_read] = '\0';
 
         // if we have full header request
-        if (strstr(conn->header_buffer, "\r\n\r\n"))
+        if (strstr(conn->req_buffer, "\r\n\r\n"))
         {
-            sscanf(conn->header_buffer, "%s %s", method, path);
+            sscanf(conn->req_buffer, "%s %s", method, path);
+            printf("Received request:\n%s %s\n", method, path);
+
+            // Handle GET method
             if (strcmp(method, "GET") == 0)
             {
-                snprintf(full_path, sizeof(full_path), "%s%s", ROOT, path);
-                if (strcmp(path, "/") == 0)
+                int res = handle_get_header(conn->fd, path, &conn->file_fd,
+                                            &conn->file_size);
+                if (res == CONN_ERROR)
                 {
-                    snprintf(full_path, sizeof(full_path), "%s/server-index.html", ROOT);
+                    perror("error completing get_header");
+                    return CONN_ERROR;
+                }
+                else if (res == CONN_CLOSED)
+                {
+                    perror("issue in client's req");
+                    return CONN_CLOSED;
                 }
 
-                // open w O_DIRECT
-                conn->file_fd = open(full_path, O_RDONLY | O_DIRECT);
-                if (conn->file_fd == -1)
-                {
-                    perror("File not found");
-                    send_response(conn->fd, "HTTP/1.1 404 Not Found", "text/plain", "File not found");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                // Get file size
-                conn->file_size = get_file_size(conn->file_fd);
-                if (conn->file_size == -1)
-                {
-                    send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Could not get file size.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
+                memset(conn->req_buffer, 0, BUFFER_SIZE); // use the req_buffer as send buffer
                 conn->byte_offset = 0;
-
-                const char *mime_type = get_mime_type(full_path);
-                printf("mime_type is: %s\n", mime_type);
-
-                char header[BUFFER_SIZE];
-                snprintf(header, sizeof(header),
-                         "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n\r\n",
-                         mime_type, conn->file_size);
-
-                send(conn->fd, header, strlen(header), 0);
+                conn->bytes_read = 0;
                 conn->state = HANDLING_GET;
-                conn->last_op = OP_READ;
             }
+            // Handle PUT method
             else if (strcmp(method, "PUT") == 0)
             {
-                if (strncmp(path, "/upload", 7) != 0)
-                {
-                    send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Invalid upload path.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                char *content_len_header = strstr(conn->header_buffer, "Content-Length: ");
-                if (!content_len_header)
-                {
-                    send_response(conn->fd, "HTTP/1.1 411 Length Required", "text/plain", "Content-Length required.");
-                    close(conn->file_fd);
-                    close(conn->fd);
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                char file_path[2048];
-
-                snprintf(file_path, sizeof(file_path), "%s/uploads%s", ROOT, path + 7);
-                printf("Trying to create file at: %s\n", file_path);
-
-                conn->file_fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
-                if (conn->file_fd == -1)
-                {
-                    perror("Error creating/opening the file");
-                    printf("FD: %d\n", conn->fd);
-                    send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error creating file.");
-                    close(conn->file_fd);
-                    close(conn->fd);
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                sscanf(content_len_header, "Content-Length: %ld", &conn->file_size);
-                conn->byte_offset = 0;
-
-                char *body_start = strstr(conn->header_buffer, "\r\n\r\n");
+                char *body_start = strstr(conn->req_buffer, "\r\n\r\n");
                 if (!body_start)
                 {
                     send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed headers.");
-                    return CONN_CLOSED_OR_ERROR;
+                    return CONN_CLOSED;
+                }
+                int res = handle_put_header(conn->fd, path, &conn->file_fd, &conn->file_size, conn->req_buffer);
+                if (res == CONN_ERROR)
+                {
+                    perror("error completing put_header");
+                    return CONN_ERROR;
+                }
+                else if (res == CONN_CLOSED)
+                {
+                    perror("issue in client's req");
+                    return CONN_CLOSED;
                 }
                 body_start += 4; // Skip past the "\r\n\r\n"
-                size_t initial_body_len = conn->bytes_read - (body_start - conn->header_buffer);
-
-                // write all of data we have rn
-                size_t bytes_processed = 0;
-
-                while (bytes_processed < initial_body_len)
+                size_t initial_body_len = n - (body_start - conn->req_buffer);
+                if (initial_body_len < 0)
+                    initial_body_len = 0;
+                if (initial_body_len > 0)
                 {
-                    size_t remaining = initial_body_len - bytes_processed;
-                    size_t chunk = remaining >= BLOCK_SIZE ? BLOCK_SIZE : remaining;
-                    memcpy(conn->buffer, body_start + bytes_processed, chunk);
-                    bytes_processed += chunk;
+                    // move the content to the start
+                    memmove(conn->req_buffer, body_start, initial_body_len);
+                    // set rest values as 0
+                    memset(conn->req_buffer + initial_body_len, 0, BUFFER_SIZE - initial_body_len);
 
-                    if (chunk < BLOCK_SIZE)
+                    if (initial_body_len >= conn->file_size)
                     {
-                        memset(conn->buffer + chunk, 0, BLOCK_SIZE - chunk);
-                        conn->util_offset = chunk;
-                        break;
+                        ssize_t written = write_fully(conn->file_fd, conn->req_buffer, BUFFER_SIZE, NON_BLOCKING);
+                        if (written == -1)
+                            return CONN_ERROR;
+                        conn->byte_offset += written;
+
+                        if (conn->byte_offset >= conn->file_size)
+                        {
+                            send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
+                            return CONN_CLOSED;
+                        }
+                        return CONN_ERROR;
                     }
-
-                    size_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-                    if (written == -1)
-                        return CONN_CLOSED_OR_ERROR;
-                    conn->byte_offset += written;
-                }
-                if (conn->util_offset + conn->byte_offset >= conn->file_size)
-                {
-                    ssize_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-                    if (written == -1)
-                        return CONN_CLOSED_OR_ERROR;
-                    conn->byte_offset += written;
-                    conn->util_offset = 0;
-                }
-                if (conn->byte_offset >= conn->file_size)
-                {
-                    send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                    close(conn->file_fd);
-                    close(conn->fd);
-                    return CONN_CLOSED_OR_ERROR;
                 }
 
-                conn->bytes_read = 0;
-                // printf("PRE-WRITES: util_offset=%zd, file_offset=%zd\n", conn->util_offset, conn->byte_offset);
-
+                conn->bytes_read = initial_body_len;
+                conn->byte_offset = 0;
                 conn->state = HANDLING_POST;
             }
-        }
-        else
-        {
-            send_response(conn->fd, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
-            close(conn->fd);
-            return CONN_CLOSED_OR_ERROR;
+            else
+            {
+                send_response(conn->fd, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
+                return CONN_CLOSED;
+            }
         }
     }
 
     else if (conn->state == HANDLING_GET)
     {
-        size_t remaining = conn->file_size - conn->byte_offset;
-        if (remaining == 0)
+        // bytes_read hold value for what we read last into buffer
+        // util offset holds value for what we have send to client from what we last read. 0 means we've sent everything
+        if (conn->util_offset == 0)
         {
-            // close(conn->file_fd);
-            return CONN_CLOSED_OR_ERROR; // Normal EOF
-        }
-        if (remaining > 0 && remaining < BLOCK_SIZE)
-        {
-            int rc = handle_partial_with_padding(conn);
-            return rc;
-        }
-
-        size_t to_read = (remaining > BUFFER_SIZE) ? BUFFER_SIZE : remaining;
-        to_read = align_to_block(to_read);
-
-        if (verify_alignment(conn) != 2)
-        {
-            return CONN_CLOSED_OR_ERROR;
-        }
-        ssize_t bytes_read = pread(conn->file_fd, conn->buffer, to_read, conn->byte_offset); // read(conn->file_fd, conn->buffer, to_read);
-
-        if (bytes_read == -1)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                return CONN_ALIVE;
-            }
-            perror("Error reading file");
-            return CONN_CLOSED_OR_ERROR;
-        }
-
-        while (conn->util_offset < bytes_read)
-        {
-            ssize_t sent = send(conn->fd, conn->buffer + conn->util_offset,
-                                bytes_read - conn->util_offset, 0);
-
-            if (sent == -1)
+            ssize_t bytes_read = pread(conn->file_fd, conn->req_buffer, BUFFER_SIZE, conn->byte_offset);
+            if (bytes_read == -1)
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    // Partial send: exit and wait for EPOLLOUT
                     return CONN_ALIVE;
-                }
-                perror("Error sending data");
-                return CONN_CLOSED_OR_ERROR;
+
+                perror("Error reading file");
+                return CONN_ERROR;
             }
-            else
-            {
-                conn->util_offset += sent;
-            }
+            conn->bytes_read = bytes_read;
+            conn->byte_offset += bytes_read;
         }
 
-        // Reset for next block
-        conn->byte_offset += bytes_read;
-        conn->util_offset = 0;
-
+        ssize_t sent = send_fully(conn->fd, conn->req_buffer + conn->util_offset, conn->bytes_read - conn->util_offset, NON_BLOCKING);
+        if (sent == -1)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return CONN_ALIVE;
+            perror("Error sending blocking data");
+            return CONN_ERROR;
+        }
+        conn->util_offset += sent;
+        if (conn->util_offset < conn->bytes_read)
+        {
+            return CONN_ALIVE;
+        }
         if (conn->byte_offset >= conn->file_size)
         {
             printf("FILE SENT SUCCESSFULLY\n");
-            return CONN_CLOSED_OR_ERROR;
+            return CONN_CLOSED;
         }
+        conn->util_offset = 0;
     }
     else if (conn->state == HANDLING_POST)
     {
-        //          while(1){
-        n = recv(conn->fd, conn->header_buffer + conn->bytes_read,
-                 sizeof(conn->header_buffer) - conn->bytes_read, 0);
-
-        // printf("PRE-WRITES: n=%zd, util_offset=%zd, file_offset=%zd\n", n, conn->util_offset, conn->byte_offset);
-
+        size_t n = recv(conn->fd, conn->req_buffer + conn->bytes_read, BUFFER_SIZE - conn->bytes_read, 0);
         if (n < 0)
         {
-            // printf("\n-----------------------N<0--------------------\n");
-            // printf("LESS N: soccketconn=%d,  n=%zd, util_offset=%zd, file_offset=%zd, file_size=%zd\n",conn->fd, n, conn->util_offset, conn->byte_offset, conn->file_size);
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                if (conn->util_offset + conn->byte_offset >= conn->file_size)
-                {
-                    memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                    ssize_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-                    if (written == -1)
-                        return CONN_CLOSED_OR_ERROR;
-                    conn->byte_offset += conn->util_offset;
-                    if (conn->byte_offset >= conn->file_size)
-                    {
-                        send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                        return CONN_CLOSED_OR_ERROR;
-                    }
-                    else
-                    {
-                        send_response(conn->fd, "HTTP/1.1 206 Internal Server Error", "text/plain", "File upload incomplete.");
-                        return CONN_CLOSED_OR_ERROR;
-                    }
-                }
                 return CONN_ALIVE;
-            }
-            if (conn->util_offset > 0)
-            {
-                // Pad & write the final block before returning
-                memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                ssize_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-                if (written == -1)
-                    return CONN_CLOSED_OR_ERROR;
-                conn->byte_offset += conn->util_offset;
-                if (conn->byte_offset >= conn->file_size)
-                {
-                    send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                    close(conn->file_fd);
-                    close(conn->fd);
-                    return CONN_CLOSED_OR_ERROR;
-                }
-                else
-                {
-                    send_response(conn->fd, "HTTP/1.1 206 Internal Server Error", "text/plain", "File upload incomplete.");
-                    close(conn->file_fd);
-                    close(conn->fd);
-                    return CONN_CLOSED_OR_ERROR;
-                }
-            }
-
-            perror("Error in recv()");
-            send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error recieving data from client");
-            close(conn->file_fd);
-            close(conn->fd);
-            return CONN_CLOSED_OR_ERROR;
+            perror("Client stopped sending");
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+            return CONN_CLOSED;
         }
-        else if (n == 0)
+        if (n == 0)
         {
-            printf("\n-----------------------N=0--------------------\n");
-            perror("Client closed connection");
-            send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "CLient closed connection. Couldn't complete upload");
-            close(conn->file_fd);
-            close(conn->fd);
-            return CONN_CLOSED_OR_ERROR;
+            perror("Client disconnected");
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+            return CONN_CLOSED;
         }
-
         conn->bytes_read += n;
-        size_t bytes_processed = 0;
 
-        // printf("BEF_WRITE-1: n= %zd, bytes_processed= %zd, remaining= %zd\n", n, bytes_processed, n - bytes_processed);
-        if (conn->util_offset > 0)
+        if (conn->bytes_read < BUFFER_SIZE)
         {
-            size_t space_left = BLOCK_SIZE - conn->util_offset;
-            size_t append_size = (n >= space_left) ? space_left : n;
-
-            memcpy(conn->buffer + conn->util_offset, conn->header_buffer + bytes_processed, append_size);
-            bytes_processed += append_size;
-
-            if (conn->util_offset + append_size == BLOCK_SIZE)
+            memset(conn->req_buffer + conn->bytes_read, 0, BUFFER_SIZE - conn->bytes_read);
+            if (conn->byte_offset + conn->bytes_read < conn->file_size)
             {
-                ssize_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-                if (written == -1)
-                    return CONN_CLOSED_OR_ERROR;
-                conn->byte_offset += written;
-                conn->util_offset = 0;
-                // printf("WRITE-1: n= %zd, bytes_processed= %zd, remaining= %zd, UTIL_OFFSET= %zd, OFFSET= %zd\n", n, bytes_processed, n - bytes_processed, conn->util_offset, conn->byte_offset);
-            }
-            else
-            {
-                conn->util_offset += append_size;
                 return CONN_ALIVE;
-                // continue;
             }
         }
 
-        while (bytes_processed < n)
+        ssize_t written = write_fully(conn->file_fd, conn->req_buffer, BUFFER_SIZE, NON_BLOCKING);
+        if (written == -1)
         {
-            // printf("BEF_WRITE-2: n= %zd, bytes_processed= %zd, remaining= %zd\n", n, bytes_processed, n - bytes_processed);
-            size_t remaining = n - bytes_processed;
-            size_t chunk = remaining > BLOCK_SIZE ? BLOCK_SIZE : remaining;
-            memcpy(conn->buffer, conn->header_buffer + bytes_processed, chunk);
-            bytes_processed += chunk;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return CONN_ALIVE;
+            return CONN_ERROR;
+        }
+        conn->byte_offset += written;
+        conn->bytes_read = 0;
 
-            if (chunk < BLOCK_SIZE)
-            {
-                memset(conn->buffer + chunk, 0, BLOCK_SIZE - chunk);
-                conn->util_offset = chunk;
-                break;
-            }
-            size_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-            if (written == -1)
-                return CONN_CLOSED_OR_ERROR;
-            conn->byte_offset += written;
-            // printf("WRITE-2: n= %zd, bytes_processed= %zd, remaining= %zd, UTIL_OFFSET= %zd, OFFSET= %zd\n\n", n, bytes_processed,  n - bytes_processed, conn->util_offset, conn->byte_offset);
-            if (verify_alignment(conn) != 2)
-            {
-                printf("ERROR WRITE:n=%zd, bytes_left= %zd, written= %zd, OFFSET= %zd \n", n, n - bytes_processed, written, conn->byte_offset);
-                return CONN_CLOSED_OR_ERROR;
-            }
-        }
-        conn->bytes_read = n - bytes_processed;
-        if (conn->util_offset + conn->byte_offset >= conn->file_size)
-        {
-            ssize_t written = write_fully(conn->file_fd, conn->buffer, BLOCK_SIZE);
-            if (written == -1)
-                return CONN_CLOSED_OR_ERROR;
-            conn->byte_offset += written;
-            conn->util_offset = 0;
-        }
-        // Upload complete
         if (conn->byte_offset >= conn->file_size)
         {
             send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-            close(conn->file_fd);
-            close(conn->fd);
-            return CONN_CLOSED_OR_ERROR;
+            return CONN_CLOSED;
         }
     }
-
     else
     {
-        perror("Error Completing the request");
+        perror("Incorect state to complete request");
         send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error completing the request.");
-        close(conn->file_fd);
-        close(conn->fd);
-        return CONN_CLOSED_OR_ERROR;
+        return CONN_CLOSED;
     }
-
     return CONN_ALIVE;
 }
 
-void submit_close(struct io_uring *ring, conn_state *conn)
-{
-    if (!conn)
-        return;
-    if (conn->file_fd != -1)
-    {
-        close(conn->file_fd);
-        conn->file_fd = -1;
-    }
-    if (conn->fd != -1)
-    {
-        close(conn->fd);
-        conn->fd = -1;
-    }
-    if (conn->buffer)
-    {
-        free(conn->buffer);
-    }
-    free(conn);
-}
-
-void io_uring_func(struct io_uring *ring, conn_state *conn, uring_func_enum func)
+int io_uring_func(struct io_uring *ring, conn_state *conn, uring_func_enum func)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe)
     {
         perror("Error getting SQE");
-        submit_close(ring, conn);
-        return;
+        return CONN_ERROR;
     }
     switch (func)
     {
-    case READ_REQUEST:
-        io_uring_prep_recv(sqe, conn->fd, conn->header_buffer + conn->bytes_read, BUFFER_SIZE - conn->bytes_read, 0);
+    case RECV_REQUEST:
+        io_uring_prep_recv(sqe, conn->fd, conn->req_buffer + conn->bytes_read, BUFFER_SIZE - conn->bytes_read, 0);
         break;
     case WRITE_FILE:
-        io_uring_prep_write(sqe, conn->file_fd, conn->buffer, BLOCK_SIZE, conn->byte_offset);
+        io_uring_prep_write(sqe, conn->file_fd, conn->req_buffer, BUFFER_SIZE, conn->byte_offset);
         break;
     case READ_FILE:
-        io_uring_prep_read(sqe, conn->file_fd, conn->buffer, BLOCK_SIZE, conn->byte_offset);
+        io_uring_prep_read(sqe, conn->file_fd, conn->req_buffer, BUFFER_SIZE, conn->byte_offset);
         break;
     case SEND_FILE:
-        size_t unsent = conn->byte_offset - conn->util_offset;
-
-        // if bytes left to send is less than block size
-        if (unsent > 0 && unsent < BLOCK_SIZE)
-        {
-            io_uring_prep_send(sqe, conn->fd, conn->buffer + (BLOCK_SIZE - unsent), unsent, 0);
-        }
-        else
-        { // else send the whole buffer
-            io_uring_prep_send(sqe, conn->fd, conn->buffer, BLOCK_SIZE, 0);
-        }
+        io_uring_prep_send(sqe, conn->fd, conn->req_buffer + conn->util_offset, BUFFER_SIZE - conn->util_offset, 0);
         break;
     default:
         perror("Invalid uring call");
-
-        break;
+        return CONN_ERROR;
     }
     io_uring_sqe_set_data(sqe, conn);
     io_uring_submit(ring);
+    return CONN_ALIVE;
 }
 
-int handle_requests_uring(struct io_uring *ring, struct io_uring_cqe *cqe)
+int handle_requests_uring(struct io_uring *ring, conn_state *conn, ssize_t res)
 {
-    conn_state *conn = (conn_state *)io_uring_cqe_get_data(cqe);
-    int res = cqe->res;
     char method[16], path[1024];
-    char full_path[2048];
 
-    switch (conn->state)
+    if (conn->state == READING_HEADER)
     {
-    case READING_HEADER:
-        if (res < 0)
-        {
-            if (res == -EAGAIN || res == -EWOULDBLOCK)
-            {
-                io_uring_func(ring, conn, READ_REQUEST);
-                return CONN_ALIVE;
-            }
-
-            return CONN_CLOSED_OR_ERROR;
-        }
-        else if (res == 0)
-        {
-            return CONN_CLOSED_OR_ERROR;
-        }
-
         conn->bytes_read += res;
-        if (strstr(conn->header_buffer, "\r\n\r\n"))
+        // if we have full header request
+        if (strstr(conn->req_buffer, "\r\n\r\n"))
         {
-            sscanf(conn->header_buffer, "%s %s", method, path);
+            sscanf(conn->req_buffer, "%s %s", method, path);
+            printf("Received request:\n%s %s\n", method, path);
+
             if (strcmp(method, "GET") == 0)
             {
-                snprintf(full_path, sizeof(full_path), "%s%s", ROOT, path);
-                if (strcmp(path, "/") == 0)
+                int ret = handle_get_header(conn->fd, path, &conn->file_fd,
+                                            &conn->file_size);
+                if (ret == CONN_ERROR)
                 {
-                    snprintf(full_path, sizeof(full_path), "%s/server-index.html", ROOT);
+                    perror("error completing get_header");
+                    return CONN_ERROR;
+                }
+                else if (ret == CONN_CLOSED)
+                {
+                    perror("issue in client's req");
+                    return CONN_CLOSED;
                 }
 
-                // open w O_DIRECT
-                conn->file_fd = open(full_path, O_RDONLY | O_DIRECT);
-                if (conn->file_fd == -1)
-                {
-                    perror("File not found");
-                    send_response(conn->fd, "HTTP/1.1 404 Not Found", "text/plain", "File not found");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                // Get file size
-                conn->file_size = get_file_size(conn->file_fd);
-                if (conn->file_size == -1)
-                {
-                    send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Could not get file size.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                const char *mime_type = get_mime_type(full_path);
-                printf("mime_type is: %s\n", mime_type);
-
-                char header[BUFFER_SIZE];
-                snprintf(header, sizeof(header),
-                         "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n\r\n",
-                         mime_type, conn->file_size);
-                send(conn->fd, header, strlen(header), 0);
-
+                memset(conn->req_buffer, 0, BUFFER_SIZE); // use the req_buffer as send buffer
                 conn->byte_offset = 0;
                 conn->bytes_read = 0;
-                conn->util_offset = 0;
                 conn->state = HANDLING_GET;
-                io_uring_func(ring, conn, READ_FILE);
                 conn->last_op = OP_READ;
+                io_uring_func(ring, conn, READ_FILE);
             }
             else if (strcmp(method, "PUT") == 0)
             {
-                if (strncmp(path, "/upload", 7) != 0)
-                {
-                    send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Invalid upload path.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-
-                char *content_len_header = strstr(conn->header_buffer, "Content-Length: ");
-                if (!content_len_header)
-                {
-                    send_response(conn->fd, "HTTP/1.1 411 Length Required", "text/plain", "Content-Length required.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-                char file_path[2048];
-
-                snprintf(file_path, sizeof(file_path), "%s/uploads%s", ROOT, path + 7);
-                printf("Trying to create file at: %s\n", file_path);
-
-                conn->file_fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
-                if (conn->file_fd == -1)
-                {
-                    perror("Error creating/opening the file");
-                    printf("FD: %d\n", conn->fd);
-                    send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error creating file.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-                sscanf(content_len_header, "Content-Length: %ld", &conn->file_size);
-                conn->byte_offset = 0;
-
-                char *body_start = strstr(conn->header_buffer, "\r\n\r\n");
+                char *body_start = strstr(conn->req_buffer, "\r\n\r\n");
                 if (!body_start)
                 {
                     send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed headers.");
-                    return CONN_CLOSED_OR_ERROR;
+                    return CONN_CLOSED;
+                }
+                int ret = handle_put_header(conn->fd, path, &conn->file_fd, &conn->file_size, conn->req_buffer);
+                if (ret == CONN_ERROR)
+                {
+                    perror("error completing put_header");
+                    return CONN_ERROR;
+                }
+                else if (ret == CONN_CLOSED)
+                {
+                    perror("issue in client's req");
+                    return CONN_CLOSED;
                 }
                 body_start += 4; // Skip past the "\r\n\r\n"
-
-                size_t initial_body_len = conn->bytes_read - (body_start - conn->header_buffer);
-
-                // writing initial data
+                size_t initial_body_len = res - (body_start - conn->req_buffer);
+                if (initial_body_len < 0)
+                    initial_body_len = 0;
                 if (initial_body_len > 0)
                 {
-                    conn->header_buffer_processed = body_start - conn->header_buffer; // so we only process after headers
-
-                    size_t remaining = conn->bytes_read - conn->header_buffer_processed;
-                    size_t chunk = remaining > BLOCK_SIZE ? BLOCK_SIZE : remaining;
-
-                    memcpy(conn->buffer, conn->header_buffer + conn->header_buffer_processed, chunk);
-                    conn->header_buffer_processed += chunk;
-                    conn->state = HANDLING_POST;
-                    io_uring_func(ring, conn, WRITE_FILE);
-                    conn->last_op = OP_WRITE;
+                    memmove(conn->req_buffer, body_start, initial_body_len);
+                    memset(conn->req_buffer + initial_body_len, 0, BUFFER_SIZE - initial_body_len);
+                    if (initial_body_len >= conn->file_size)
+                    {
+                        // write what we have
+                        conn->state = HANDLING_POST;
+                        conn->last_op = OP_WRITE;
+                        io_uring_func(ring, conn, WRITE_FILE);
+                        return CONN_ALIVE;
+                    }
                 }
-                else
-                {
-                    conn->bytes_read = 0;
-                    conn->state = HANDLING_POST;
-                    io_uring_func(ring, conn, READ_REQUEST);
-                    conn->last_op = OP_READ;
-                }
+                conn->bytes_read = initial_body_len;
+                conn->byte_offset = 0;
+                conn->state = HANDLING_POST;
+                conn->last_op = OP_READ; // from server
+                io_uring_func(ring, conn, RECV_REQUEST);
             }
             else
             {
                 send_response(conn->fd, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed.");
-                return CONN_CLOSED_OR_ERROR;
+                return CONN_CLOSED;
             }
         }
-        break;
-    case HANDLING_GET:
-        if (conn->byte_offset >= conn->file_size && conn->util_offset == conn->byte_offset)
-        {
-            printf("FILE SENT SUCCESSFULLY\n");
-            return CONN_CLOSED_OR_ERROR;
-        }
+        return CONN_ALIVE;
+    }
+    else if (conn->state == HANDLING_GET)
+    {
         if (conn->last_op == OP_READ)
         {
-            // res is from the read req
-            if (res == -1)
+            if (conn->util_offset == 0)
             {
-                perror("PREAD FAILED: ");
-                return CONN_CLOSED_OR_ERROR;
+                conn->bytes_read = res;
+                conn->byte_offset += res;
             }
-            if (res == 0)
-            {
-                if (conn->util_offset < conn->byte_offset)
-                {
-                    // send last buffer
-                    io_uring_func(ring, conn, SEND_FILE);
-                    conn->last_op = OP_WRITE;
-                    return CONN_ALIVE;
-                }
-                return CONN_CLOSED_OR_ERROR;
-            }
-            conn->byte_offset += res; // to track what we've read
-
-            // send what we just read
+            conn->last_op = OP_WRITE;
             io_uring_func(ring, conn, SEND_FILE);
-            conn->last_op = OP_WRITE;
+            return CONN_ALIVE;
+        }
+        else if (conn->last_op == OP_WRITE)
+        {
+            conn->util_offset += res;
+
+            if (conn->util_offset < conn->bytes_read)
+            {
+                io_uring_func(ring, conn, SEND_FILE);
+                return CONN_ALIVE;
+            }
+            if (conn->byte_offset >= conn->file_size)
+            {
+                printf("FILE SENT SUCCESSFULLY\n");
+                return CONN_CLOSED;
+            }
+            conn->util_offset = 0;
+            conn->last_op = OP_READ;
+            io_uring_func(ring, conn, READ_FILE);
         }
         else
         {
-            // res is from the send req
-            if (res == -1)
-            {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    io_uring_func(ring, conn, READ_FILE);
-                    return CONN_ALIVE;
-                }
-                perror("Error sending data");
-                return CONN_CLOSED_OR_ERROR;
-            }
-            conn->util_offset += res; // to track what we've sent
-            if (conn->byte_offset >= conn->file_size && conn->util_offset == conn->byte_offset)
-            {
-                // last offset was read and sent.
-                printf("FILE SENT SUCCESSFULLY\n");
-                return CONN_CLOSED_OR_ERROR;
-            }
-
-            io_uring_func(ring, conn, READ_FILE);
-            conn->last_op = OP_READ;
+            perror("incorrect last_op");
+            return CONN_ERROR;
         }
-        break;
-    case HANDLING_POST:
-
+    }
+    else if (conn->state == HANDLING_POST)
+    {
         if (conn->last_op == OP_READ)
         {
-            printf("READ: n=%d, util_offset=%zd, file_offset=%zd, file_size=%zd, las_op=%d\n", res, conn->util_offset, conn->byte_offset, conn->file_size, conn->last_op);
-            // res is from the req reads
-            if (res < 0)
-            {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    if (conn->byte_offset >= conn->file_size)
-                    {
-                        send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                        return CONN_CLOSED_OR_ERROR;
-                    }
-                    if (conn->util_offset > 0 && conn->util_offset + conn->byte_offset >= conn->file_size)
-                    {
-                        memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                        io_uring_func(ring, conn, WRITE_FILE);
-                        conn->last_op = OP_WRITE;
-                        conn->util_offset = 0;
-                    }
-                    return CONN_ALIVE;
-                }
-                // write final chunk if any
-                if (conn->util_offset > 0 && conn->util_offset + conn->byte_offset >= conn->file_size)
-                {
-                    memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                    io_uring_func(ring, conn, WRITE_FILE);
-                    conn->last_op = OP_WRITE;
-                    conn->util_offset = 0;
-                    return CONN_ALIVE;
-                }
-                printf("error in recv");
-                return CONN_CLOSED_OR_ERROR;
-            }
-            if (res == 0)
-            {
-                if (conn->util_offset > 0 && conn->util_offset + conn->byte_offset >= conn->file_size)
-                {
-                    memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                    io_uring_func(ring, conn, WRITE_FILE);
-                    conn->last_op = OP_WRITE;
-                    conn->util_offset = 0;
-                    return CONN_ALIVE;
-                }
-                if (conn->byte_offset >= conn->file_size)
-                {
-                    send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                    return CONN_CLOSED_OR_ERROR;
-                }
-                return CONN_CLOSED_OR_ERROR;
-            }
             conn->bytes_read += res;
-
-            size_t remaining = conn->bytes_read - conn->header_buffer_processed;
-            size_t chunk = remaining > BLOCK_SIZE ? BLOCK_SIZE : remaining;
-
-            if (conn->util_offset > 0)
+            if (conn->bytes_read < BUFFER_SIZE)
             {
-                size_t space_left = BLOCK_SIZE - conn->util_offset;
-                size_t append_size = (chunk >= space_left) ? space_left : chunk;
-                memcpy(conn->buffer + conn->util_offset, conn->header_buffer, append_size);
-                conn->header_buffer_processed += append_size;
-                if (conn->util_offset + append_size == BLOCK_SIZE)
+                // if we can read more into buffer and its still less than file size, keep reading to fill buffer
+                memset(conn->req_buffer + conn->bytes_read, 0, BUFFER_SIZE - conn->bytes_read);
+                if (conn->byte_offset + conn->bytes_read < conn->file_size)
                 {
-                    io_uring_func(ring, conn, WRITE_FILE);
-                    conn->last_op = OP_WRITE;
-                    conn->util_offset = 0;
-                }
-                else
-                {
-                    conn->util_offset += append_size;
-                    io_uring_func(ring, conn, READ_REQUEST);
                     conn->last_op = OP_READ;
-                }
-                return CONN_ALIVE;
-            }
-            memcpy(conn->buffer, conn->header_buffer + conn->header_buffer_processed, chunk);
-            conn->header_buffer_processed += chunk;
-            io_uring_func(ring, conn, WRITE_FILE);
-            conn->last_op = OP_WRITE;
-        }
-        else
-        {
-            printf("WRITTEN: n=%d, util_offset=%zd, file_offset=%zd, file_size=%zd, las_op=%d, header_buffer_processed=%zd, bytes_read=%zd \n", res, conn->util_offset, conn->byte_offset, conn->file_size, conn->last_op, conn->header_buffer_processed, conn->bytes_read);
-            // res is from the writes
-            if (res < 0)
-            {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    if (conn->byte_offset >= conn->file_size)
-                    {
-                        send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                        return CONN_CLOSED_OR_ERROR;
-                    }
-                    if (conn->util_offset > 0 && conn->util_offset + conn->byte_offset >= conn->file_size)
-                    {
-                        memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                        io_uring_func(ring, conn, WRITE_FILE);
-                        conn->last_op = OP_WRITE;
-                        conn->util_offset = 0;
-                    }
+                    io_uring_func(ring, conn, RECV_REQUEST);
                     return CONN_ALIVE;
                 }
-                perror("Write Failed");
-                return CONN_CLOSED_OR_ERROR;
             }
-
-            if (res == 0)
-            {
-                perror("BUFFER is 0");
-                // keep reading
-                conn->bytes_read -= conn->header_buffer_processed;
-                io_uring_func(ring, conn, READ_REQUEST);
-                conn->last_op = OP_READ;
-                return CONN_ALIVE;
-            }
-            conn->byte_offset += res; // bytes written to file
-
+            // write what we just recvd from req
+            conn->last_op = OP_WRITE;
+            io_uring_func(ring, conn, WRITE_FILE);
+            return CONN_ALIVE;
+        }
+        else if (conn->last_op == OP_WRITE)
+        {
+            conn->byte_offset += res;
+            conn->bytes_read = 0; // to indicate read block you've written everything from buffer
             if (conn->byte_offset >= conn->file_size)
             {
                 send_response(conn->fd, "HTTP/1.1 201 Created", "text/plain", "File uploaded.");
-                return CONN_CLOSED_OR_ERROR;
+                return CONN_CLOSED;
             }
 
-            size_t remaining = conn->bytes_read - conn->header_buffer_processed;
-            size_t chunk = remaining > BLOCK_SIZE ? BLOCK_SIZE : remaining; // writing only this much
-
-            memcpy(conn->buffer, conn->header_buffer + conn->header_buffer_processed, chunk);
-            conn->header_buffer_processed += chunk;
-
-            if (chunk == BLOCK_SIZE)
-            {
-                io_uring_func(ring, conn, WRITE_FILE);
-                conn->last_op = OP_WRITE;
-                return CONN_ALIVE;
-            }
-            else
-            {
-                memset(conn->buffer + chunk, 0, BLOCK_SIZE - chunk);
-                conn->util_offset = chunk; // bytes used in buffer
-                if (conn->util_offset + conn->byte_offset >= conn->file_size)
-                {
-                    memset(conn->buffer + conn->util_offset, 0, BLOCK_SIZE - conn->util_offset);
-                    io_uring_func(ring, conn, WRITE_FILE);
-                    conn->last_op = OP_WRITE;
-                    conn->util_offset = 0;
-                    return CONN_ALIVE;
-                }
-            }
-            if (conn->bytes_read != 0 && conn->header_buffer_processed == conn->bytes_read)
-            {
-                // all bytes from header buffer processed
-                conn->header_buffer_processed = 0;
-                conn->bytes_read = 0;
-                io_uring_func(ring, conn, READ_REQUEST);
-                conn->last_op = OP_READ;
-                return CONN_ALIVE;
-            }
-
-            // keep reading
-            conn->bytes_read -= conn->header_buffer_processed;
-            io_uring_func(ring, conn, READ_REQUEST);
+            // keep recving if bytes not complete
             conn->last_op = OP_READ;
+            io_uring_func(ring, conn, RECV_REQUEST);
         }
-        return CONN_ALIVE;
-        break;
-    default:
-        perror("Error Completing the request");
-        send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error completing the request.");
-        return CONN_CLOSED_OR_ERROR;
+        else
+        {
+            perror("incorrect last_op");
+            return CONN_ERROR;
+        }
     }
+    else
+    {
+        perror("Incorect state to complete request");
+        send_response(conn->fd, "HTTP/1.1 500 Internal Server Error", "text/plain", "Error completing the request.");
+        return CONN_CLOSED;
+    }
+
     return CONN_ALIVE;
 }

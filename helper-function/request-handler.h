@@ -18,12 +18,13 @@
 #include <fcntl.h>    // for file control options
 #include <sys/stat.h> // to get file stats
 #include <sys/mman.h> // for memory alignment
-#include <liburing.h> // uring
+
+#include <liburing.h> //for uring
 
 #define SERVER_PORT 8083
 #define ACCEPT_BACKLOG 4096
 #define BUFFER_SIZE 64 * 1024 // 64kb or 16 blocks on (hardware)
-#define BLOCK_SIZE 4096
+#define MY_BLOCK_SIZE 4096
 #define ROOT "/var/www/html"
 
 #define CONN_CLOSED 1
@@ -31,11 +32,18 @@
 #define CONN_CLOSED_OR_ERROR 1
 #define CONN_ALIVE 0
 
-_Static_assert(BUFFER_SIZE % BLOCK_SIZE == 0,
+_Static_assert(BUFFER_SIZE % MY_BLOCK_SIZE == 0,
                "BUFFER_SIZE must be multiple of BLOCK_SIZE");
 
 typedef enum
 {
+    BLOCKING,
+    NON_BLOCKING
+} server_type;
+
+typedef enum
+{
+    ACCEPTING_CONNECTION,
     READING_HEADER,
     HANDLING_GET,
     HANDLING_POST
@@ -49,7 +57,7 @@ typedef enum
 
 typedef enum
 {
-    READ_REQUEST,
+    RECV_REQUEST,
     WRITE_FILE,
     READ_FILE,
     SEND_FILE
@@ -57,9 +65,8 @@ typedef enum
 
 typedef struct
 {
-    int fd; // fd of client
-    char header_buffer[BUFFER_SIZE];
-    char *buffer;      // aligned buffer
+    int fd;            // fd of client
+    char *req_buffer;  // aligned buffer
     size_t bytes_read; // of the request
     off_t file_size;   // total file size
     int file_fd;       // fd of file to send or of being written
@@ -73,10 +80,11 @@ typedef struct
     operation_type last_op;
 } conn_state;
 
-void handle_requests(int client_socket);
+void send_response(int client_socket, const char *status, const char *content_type, const char *body);
+int handle_blocking_requests(int client_socket, int *file_fd, char *req_buffer);
 int handle_requests_event_driven(conn_state *conn);
-int handle_requests_uring(struct io_uring *ring, struct io_uring_cqe *cqe);
+int handle_requests_uring(struct io_uring *ring, conn_state *conn, ssize_t res);
 void submit_close(struct io_uring *ring, conn_state *conn);
-void io_uring_func(struct io_uring *ring, conn_state *conn, uring_func_enum func);
+int io_uring_func(struct io_uring *ring, conn_state *conn, uring_func_enum func);
 
 #endif
