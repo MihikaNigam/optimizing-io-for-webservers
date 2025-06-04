@@ -1,6 +1,11 @@
 #include "request-handler.h"
 
 #include <pthread.h>
+#include <sys/time.h>
+
+#define ACCEPT_TIMEOUT_MS 100 // Timeout after 100ms of no new connections
+#define MAX_PENDING_ACCEPTS 2048
+
 
 void *handle_client(void *arg)
 {
@@ -41,6 +46,10 @@ int main()
         return 1;
     }
 
+    int enable = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
+
     // CONFIGURE & BIND
     memset(&server_addr, 0, sizeof(server_addr)); // Zero out the structure
     server_addr.sin_family = AF_INET;
@@ -65,40 +74,77 @@ int main()
     // ALLOW
     while (1)
     {
-        client_socket = accept(server_socket,
-                               (struct sockaddr *)&client_addr,
-                               &client_len);
-        if (client_socket < 0)
+        // Phase 1: Accept multiple connections quickly
+        int accepted_sockets[MAX_PENDING_ACCEPTS];
+        int accept_count = 0;
+        struct timeval start_time, current_time;
+
+        gettimeofday(&start_time, NULL);
+
+        while (accept_count < MAX_PENDING_ACCEPTS)
         {
-            perror("Error accepting connection");
-            continue; // Continue to accept next connection
+            // Set timeout
+            fd_set read_fds;                  // set of fds to monitor
+            FD_ZERO(&read_fds);               // clear the set
+            FD_SET(server_socket, &read_fds); // add server fd to the set
+
+            struct timeval timeout = {
+                .tv_sec = 0,
+                .tv_usec = (ACCEPT_TIMEOUT_MS * 1000)};
+
+            // Wait for activity with timeout
+            int ready = select(server_socket + 1, &read_fds, NULL, NULL, &timeout);
+            if (ready <= 0)
+            {
+                break; // Timeout or error
+            }
+
+            client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+            if (client_socket < 0)
+            {
+                if (errno == EWOULDBLOCK || errno == EAGAIN)
+                {
+                    // No more pending connections
+                    break;
+                }
+                perror("Error accepting connection");
+                continue;
+            }
+
+            // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            accepted_sockets[accept_count++] = client_socket;
+
+            // Check elapsed time
+            gettimeofday(&current_time, NULL);
+            long elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 +
+                              (current_time.tv_usec - start_time.tv_usec) / 1000;
+            if (elapsed_ms >= ACCEPT_TIMEOUT_MS)
+            {
+                break;
+            }
         }
-
-        // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        // Allocate memory for the client socket to pass to the thread
-        int *pclient = malloc(sizeof(int));
-        if (pclient == NULL)
+        // Phase 2: Handle accepted connections
+        for (int i = 0; i < accept_count; i++)
         {
-            perror("Failed to allocate memory for client socket");
-            close(client_socket);
-            continue;
-        }
-        *pclient = client_socket;
+            int *pclient = malloc(sizeof(int));
+            if (pclient == NULL)
+            {
+                perror("Failed to allocate memory for client socket");
+                close(client_socket);
+                continue;
+            }
+            *pclient = accepted_sockets[i];
 
-        // THREAD
-        pthread_t tid;
-        // Create a new thread to handle the client connection
-        if (pthread_create(&tid, NULL, handle_client, pclient) != 0)
-        {
-            perror("Failed to create thread");
-            free(pclient);
-            close(client_socket);
-            continue;
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, handle_client, pclient) != 0)
+            {
+                perror("pthread_create");
+                free(pclient);
+                close(accepted_sockets[i]);
+                continue;
+            }
+            pthread_detach(tid);
         }
-
-        // Detach the thread so that it cleans up after itself
-        pthread_detach(tid);
     }
 
     // CLOSE

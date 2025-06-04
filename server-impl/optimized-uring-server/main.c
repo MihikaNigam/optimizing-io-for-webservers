@@ -2,7 +2,7 @@
 
 #include <fcntl.h>
 
-#define QUEUE_DEPTH 8192
+#define QUEUE_DEPTH 1024
 
 static atomic_int req_counter = 0;
 
@@ -31,35 +31,28 @@ int add_accept_request(int server_socket, struct io_uring *ring, struct sockaddr
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe)
     {
-        if (io_uring_sq_space_left(ring) == 0)
-        {
-            io_uring_submit(ring);
-            sqe = io_uring_get_sqe(ring);
-            if (!sqe)
-            {
-                fprintf(stderr, "Failed to get SQE in add_accept_request: %s\n", strerror(errno));
-                return CONN_ERROR;
-            }
-            reset_req_counter();
-        }
+        fprintf(stderr, "failed to fetch sqe in submit_accept: %s\n", strerror(errno));
+        return -1;
     }
+    io_uring_prep_accept(sqe, server_socket, (struct sockaddr *)client_addr,
+                         client_len, SOCK_NONBLOCK);
 
     // initializing connection state for client
     conn_state *conn = malloc(sizeof(conn_state));
     memset(conn, 0, sizeof(conn_state));
     if (posix_memalign((void **)&conn->req_buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
     {
-        perror("Failed to allocate aligned buffer");
+        fprintf(stderr, "Failed to allocate aligned buffer: %s\n", strerror(errno));
         free(conn);
-        return CONN_ERROR;
+        return -1;
     }
     memset(conn->req_buffer, 0, BUFFER_SIZE);
     conn->file_fd = -1;
     conn->state = ACCEPTING_CONNECTION;
-    io_uring_prep_accept(sqe, server_socket, (struct sockaddr *)client_addr,
-                         client_len, SOCK_NONBLOCK);
+
     io_uring_sqe_set_data(sqe, conn);
-    return CONN_ALIVE;
+    io_uring_submit(ring);
+    return 0;
 }
 
 void close_conn(conn_state *conn)
@@ -75,19 +68,11 @@ void close_conn(conn_state *conn)
     free(conn);
 }
 
-void print_sq_poll_kernel_thread_status()
-{
-
-    if (system("ps --ppid 2 | grep io_uring-sq") == 0)
-        printf("Kernel thread io_uring-sq found running...\n");
-    else
-        printf("Kernel thread io_uring-sq is not running.\n");
-}
-
 int main()
 {
     int server_socket;
-    struct sockaddr_in server_addr;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
     struct io_uring ring;
     struct io_uring_params params;
     struct io_uring_cqe *cqe;
@@ -102,10 +87,6 @@ int main()
 
     // make the server socket non-blocking
     make_non_blocking(server_socket);
-
-    int enable = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
 
     // BIND
     memset(&server_addr, 0, sizeof(server_addr)); // Zero out the structure
@@ -142,82 +123,50 @@ int main()
 
     // ALLOW
     // 1st connection req
-    struct sockaddr_in client_addr1;
-    socklen_t client_len1 = sizeof(client_addr1);
-    if (add_accept_request(server_socket, &ring, &client_addr1, &client_len1) < 0)
+    if (add_accept_request(server_socket, &ring, &client_addr, &client_len) < 0)
     {
         perror("Error accepting 1st connection");
         close(server_socket);
         exit(1);
         return 1;
     }
-    io_uring_submit(&ring);
-
-    // Pre-seed with multiple accept requests
-    for (int i = 0; i < 10; i++)
-    {
-        if (add_accept_request(server_socket, &ring, &client_addr, &client_len) < 0)
-        {
-            fprintf(stderr, "Failed to add initial accept request\n");
-            close(server_socket);
-            return 1;
-        }
-    }
-
-    printf("SQPOLL thread active (thread ID: %d)\n", print_sq_poll_kernel_thread_status());
 
     while (1)
     {
-        unsigned cqe_count;
-        struct io_uring_cqe *cqes[BATCH_SIZE];
-        int ret = io_uring_peek_batch_cqe(&ring, cqes, BATCH_SIZE);
-
+        int ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0)
         {
             if (errno == -EINTR)
                 continue;
-            fprintf(stderr, "Error in uring_peek_batch_cqe: %s\n", strerror(errno));
+            fprintf(stderr, "Error in uring_wait_cqe: %s\n", strerror(errno));
             break;
         }
-        if (ret == 0)
-        {
-            // no res availble yet so continue loop
-            // Submit any prepared SQEs if we have a batch
-            if (get_req_counter() > 0)
-            {
-                io_uring_submit(&ring);
-                reset_req_counter();
-            }
+        conn_state *conn = (conn_state *)io_uring_cqe_get_data(cqe);
+        ssize_t res = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
+
+        if (!conn)
             continue;
-        }
-        cqe_count = ret;
 
-        for (unsigned i = 0; i < cqe_count; i++)
+        if (res < 0)
         {
-            cqe = cqes[i];
-            conn_state *conn = (conn_state *)io_uring_cqe_get_data(cqe);
-            ssize_t res = cqe->res;
-
-            if (!conn)
+            if (res == -EAGAIN || res == -EWOULDBLOCK)
                 continue;
 
-            if (res < 0)
-            {
-                if (res == -EAGAIN || res == -EWOULDBLOCK)
-                    continue;
-                fprintf(stderr, "Async request failed: %s for state: %d\n",
-                        strerror(-cqe->res), conn->state);
-                send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
-                close_conn(conn);
-            }
-            else if (res == 0)
-            {
-                fprintf(stderr, "Client disconnected: %s for state: %d\n",
-                        strerror(-cqe->res), conn->state);
-                send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
-                close_conn(conn);
-            }
-
+            fprintf(stderr, "Async request failed: %s for state: %d\n",
+                    strerror(-cqe->res), conn->state);
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+            close_conn(conn);
+        }
+        else if (res == 0)
+        {
+            fprintf(stderr, "Client disconnected: %s for state: %d\n",
+                    strerror(-cqe->res), conn->state);
+            send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+            close_conn(conn);
+        }
+        else
+        {
             // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
             if (conn->state == ACCEPTING_CONNECTION)
@@ -225,17 +174,10 @@ int main()
                 conn->fd = res;
                 conn->state = READING_HEADER;
                 conn->last_op = OP_READ;
-                if (io_uring_func(&ring, conn, RECV_REQUEST) < 0)
-                {
-                    close_conn(conn);
-                    continue;
-                }
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
+                io_uring_func(&ring, conn, RECV_REQUEST);
 
                 if (add_accept_request(server_socket, &ring, &client_addr, &client_len) < 0)
                     continue;
-                increment_req_counter();
             }
             else
             {
@@ -251,20 +193,8 @@ int main()
                 }
             }
         }
-
-        // Submit any prepared SQEs if we have a batch
-        if (get_req_counter() > BATCH_SIZE)
-        {
-            io_uring_submit(&ring);
-            reset_req_counter();
-        }
-
-        // if (io_uring_sq_ready(&ring) > QUEUE_DEPTH / 2)
-        //     io_uring_submit(&ring); // Manual kick
-
-        if (cqe_count > 0)
-            io_uring_cq_advance(&ring, cqe_count);
     }
+    printf("LASST loop_counter: %d\n", loop_counter);
 
     io_uring_queue_exit(&ring);
     close(server_socket);

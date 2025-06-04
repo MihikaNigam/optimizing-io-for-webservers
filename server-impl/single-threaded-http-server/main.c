@@ -1,10 +1,13 @@
 #include "request-handler.h"
 
+#include <sys/time.h>
+
+#define ACCEPT_TIMEOUT_MS 100 // Timeout after 100ms of no new connections
+
 int main()
 {
-    int server_socket, client_socket;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    int server_socket;
+    struct sockaddr_in server_addr;
 
     // CREATE
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -13,6 +16,10 @@ int main()
         perror("Error creating socket");
         return 1;
     }
+
+    int enable = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
 
     // CONFIGURE & BIND
     memset(&server_addr, 0, sizeof(server_addr)); // Zero out the structure
@@ -38,36 +45,72 @@ int main()
     // ALLOW
     while (1)
     {
-        client_socket = accept(server_socket,
-                               (struct sockaddr *)&client_addr,
-                               &client_len);
-        if (client_socket < 0)
-        {
-            perror("Error accepting client connection");
-            continue; // Continue to accept next connection
-        }
+        int accepted_sockets[MAX_PENDING_ACCEPTS];
+        int accept_count = 0;
 
-        // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+        while (accept_count < MAX_PENDING_ACCEPTS)
+        {
+            // Set timeout
+            fd_set read_fds;                  // set of fds to monitor
+            FD_ZERO(&read_fds);               // clear the set
+            FD_SET(server_socket, &read_fds); // add server fd to the set
 
-        int file_fd;
-        char *req_buffer;
-        if (posix_memalign((void **)&req_buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
-        {
-            perror("Failed to allocate aligned buffer");
-            close(client_socket);
-            continue;
+            struct timeval timeout = {
+                .tv_sec = 0,
+                .tv_usec = (ACCEPT_TIMEOUT_MS * 1000)};
+
+            // Wait for activity with timeout
+            int ready = select(server_socket + 1, &read_fds, NULL, NULL, &timeout);
+            if (ready <= 0)
+            {
+                break; // Timeout or error
+            }
+
+            int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+            if (client_socket < 0)
+            {
+                if (errno == EWOULDBLOCK || errno == EAGAIN)
+                {
+                    // usleep(5000); //to prevent busy waiting
+                    break;
+                }
+                perror("Error accepting connection");
+                continue;
+            }
+
+            accepted_sockets[accept_count++] = client_socket;
+            // Check elapsed time
+            gettimeofday(&current_time, NULL);
+            long elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 +
+                              (current_time.tv_usec - start_time.tv_usec) / 1000;
+            if (elapsed_ms >= ACCEPT_TIMEOUT_MS)
+            {
+                break;
+            }
         }
-        memset(req_buffer, 0, BUFFER_SIZE);
-        int res = handle_blocking_requests(client_socket, &file_fd, req_buffer);
-        if (res == CONN_ERROR)
+        for (int i = 0; i < accept_count; i++)
         {
-            send_response(client_socket, "HTTP/1.1 500 Internal Server Error", "text/plain", "Internal Server Error");
+            // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+
+            int file_fd;
+            char *req_buffer;
+            if (posix_memalign((void **)&req_buffer, MY_BLOCK_SIZE, BUFFER_SIZE) != 0)
+            {
+                perror("Failed to allocate aligned buffer");
+                close(accepted_sockets[i]);
+                continue;
+            }
+            memset(req_buffer, 0, BUFFER_SIZE);
+            int res = handle_blocking_requests(accepted_sockets[i], &file_fd, req_buffer);
+            if (res == CONN_ERROR)
+            {
+                send_response(accepted_sockets[i], "HTTP/1.1 500 Internal Server Error", "text/plain", "Internal Server Error");
+            }
+            close(file_fd);
+            free(req_buffer);
+            close(accepted_sockets[i]);
         }
-        close(file_fd);
-        free(req_buffer);
-        close(client_socket);
     }
-
     // CLOSE
     close(server_socket);
     printf("Connection closed.\n");
