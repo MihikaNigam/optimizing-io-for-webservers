@@ -261,7 +261,6 @@ int main()
 
                 if (add_accept_request(server_socket, &ring, &client_addr, &client_len) < 0)
                     continue;
-                increment_req_counter();
             }
             else
             {

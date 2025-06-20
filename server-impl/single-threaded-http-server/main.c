@@ -50,21 +50,6 @@ int main()
 
         while (accept_count < MAX_PENDING_ACCEPTS)
         {
-            // Set timeout
-            fd_set read_fds;                  // set of fds to monitor
-            FD_ZERO(&read_fds);               // clear the set
-            FD_SET(server_socket, &read_fds); // add server fd to the set
-
-            struct timeval timeout = {
-                .tv_sec = 0,
-                .tv_usec = (ACCEPT_TIMEOUT_MS * 1000)};
-
-            // Wait for activity with timeout
-            int ready = select(server_socket + 1, &read_fds, NULL, NULL, &timeout);
-            if (ready <= 0)
-            {
-                break; // Timeout or error
-            }
 
             int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
             if (client_socket < 0)
@@ -79,14 +64,6 @@ int main()
             }
 
             accepted_sockets[accept_count++] = client_socket;
-            // Check elapsed time
-            gettimeofday(&current_time, NULL);
-            long elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 +
-                              (current_time.tv_usec - start_time.tv_usec) / 1000;
-            if (elapsed_ms >= ACCEPT_TIMEOUT_MS)
-            {
-                break;
-            }
         }
         for (int i = 0; i < accept_count; i++)
         {
