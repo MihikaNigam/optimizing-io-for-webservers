@@ -174,7 +174,7 @@ int main()
 
         if (ret < 0)
         {
-            if (errno == -EINTR)
+            if (errno == -EINTR || errno == -EAGAIN)
                 continue;
             fprintf(stderr, "Error in uring_peek_batch_cqe: %s\n", strerror(errno));
             break;
@@ -207,14 +207,15 @@ int main()
                     continue;
                 fprintf(stderr, "Async request failed: %s for state: %d\n",
                         strerror(-cqe->res), conn->state);
-                send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
+                if (conn->fd)
+                    send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Malformed Request.");
                 close_conn(conn);
             }
             else if (res == 0)
             {
                 fprintf(stderr, "Client disconnected: %s for state: %d\n",
                         strerror(-cqe->res), conn->state);
-                send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
+                // send_response(conn->fd, "HTTP/1.1 400 Bad Request", "text/plain", "Client Disconnected");
                 close_conn(conn);
             }
 

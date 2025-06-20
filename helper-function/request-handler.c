@@ -72,7 +72,7 @@ int handle_get_header(int client_socket, char *path, int *file_fd,
 
     // open w O_DIRECT
     if (s_type == NON_BLOCKING)
-        *file_fd = open(full_path, O_RDONLY | O_DIRECT | O_NONBLOCK);
+        *file_fd = open(full_path, O_RDONLY | O_DIRECT | O_NONBLOCK); // remove O_DIRECT for buffered io
     else
         *file_fd = open(full_path, O_RDONLY | O_DIRECT);
 
@@ -401,6 +401,7 @@ int libaio_func(conn_state *conn, async_func_enum func, io_context_t *ctx_ptr, i
     io_set_eventfd(&conn->aio_iocb, *event_fd_ptr);
     conn->aio_iocb.data = conn;
 
+    // precautionary
     if (get_req_counter() >= BATCH_SIZE)
     {
         submit_iocbs(*ctx_ptr);
@@ -711,13 +712,7 @@ int io_uring_func(struct io_uring *ring, conn_state *conn, async_func_enum func)
         return CONN_ERROR;
     }
     io_uring_sqe_set_data(sqe, conn);
-    if (get_req_counter() >= BATCH_SIZE)
-    {
-        reset_req_counter();
-        io_uring_submit(ring);
-    }
-    else
-        increment_req_counter();
+    increment_req_counter();
     return CONN_ALIVE;
 }
 

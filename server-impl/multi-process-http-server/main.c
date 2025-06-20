@@ -5,11 +5,38 @@
 #define ACCEPT_TIMEOUT_MS 100
 #define MAX_PENDING_ACCEPTS 2048
 
+void make_non_blocking(int socket_fd)
+{
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1)
+    {
+        perror("fcntl F_GETFL");
+        exit(EXIT_FAILURE);
+    }
+    if (fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == -1)
+    {
+        perror("fcntl F_SETFL");
+        exit(EXIT_FAILURE);
+    }
+}
+
 int main()
 {
-    int server_socket, client_socket;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset); // Pin to core 0
+
+    if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpuset) == -1)
+    {
+        perror("sched_setaffinity");
+        // Handle error
+    }
+    else
+    {
+        printf("Process %d pinned to core 1.\n", getpid());
+    }
+    int server_socket;
+    struct sockaddr_in server_addr;
 
     // Avoid child from becoming a zombie process
     signal(SIGCHLD, SIG_IGN);
@@ -21,6 +48,9 @@ int main()
         perror("Error creating socket");
         return 1;
     }
+
+    // make the server socket non-blocking
+    make_non_blocking(server_socket);
 
     int enable = 1;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
@@ -52,26 +82,11 @@ int main()
     {
         int accepted_sockets[MAX_PENDING_ACCEPTS];
         int accept_count = 0;
-        struct timeval start_time, current_time;
-
-        gettimeofday(&start_time, NULL);
 
         while (accept_count < MAX_PENDING_ACCEPTS)
         {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(server_socket, &read_fds);
-
-            struct timeval timeout = {
-                .tv_sec = 0,
-                .tv_usec = ACCEPT_TIMEOUT_MS * 1000};
-
-            int ready = select(server_socket + 1, &read_fds, NULL, NULL, &timeout);
-            if (ready <= 0)
-            {
-                break; // Timeout or error
-            }
-
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
             int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
             if (client_socket < 0)
             {
@@ -82,17 +97,7 @@ int main()
                 perror("Error accepting connection");
                 continue;
             }
-
             accepted_sockets[accept_count++] = client_socket;
-
-            // Check elapsed time
-            gettimeofday(&current_time, NULL);
-            long elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 +
-                              (current_time.tv_usec - start_time.tv_usec) / 1000;
-            if (elapsed_ms >= ACCEPT_TIMEOUT_MS)
-            {
-                break;
-            }
         }
         for (int i = 0; i < accept_count; i++)
         {

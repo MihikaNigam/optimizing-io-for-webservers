@@ -76,9 +76,22 @@ int init_aio_context(io_context_t *ctx, int *event_fd, unsigned int max_events)
 
 int main()
 {
-    int server_socket, client_socket, epoll_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset); // Pin to core 0
+
+    if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpuset) == -1)
+    {
+        perror("sched_setaffinity");
+        // Handle error
+    }
+    else
+    {
+        printf("Process %d pinned to core 1.\n", getpid());
+    }
+    
+    int server_socket, epoll_fd;
+    struct sockaddr_in server_addr;
     struct epoll_event event, events[MAX_EVENTS];
 
     io_context_t global_aio_ctx = 0; // output context
@@ -196,7 +209,9 @@ int main()
                 // drain accept events from listen queue
                 while (1)
                 {
-                    client_socket = accept4(server_socket,
+                    struct sockaddr_in client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_socket = accept4(server_socket,
                                             (struct sockaddr *)&client_addr,
                                             &client_len, SOCK_NONBLOCK);
 

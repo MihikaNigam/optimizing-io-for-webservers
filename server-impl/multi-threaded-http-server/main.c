@@ -3,14 +3,26 @@
 #include <pthread.h>
 #include <sys/time.h>
 
-#define ACCEPT_TIMEOUT_MS 100 // Timeout after 100ms of no new connections
 #define MAX_PENDING_ACCEPTS 2048
-
 
 void *handle_client(void *arg)
 {
     int client_socket = *(int *)arg;
     free(arg); // Free the allocated memory for the socket descriptor
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset); // Pin to core 0
+
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == -1)
+    {
+        perror("pthread_setaffinity_np");
+        // Handle error
+    }
+    else
+    {
+        printf("Thread %lu pinned to core %d.\n", (unsigned long)pthread_self(), 1);
+    }
 
     int file_fd;
     char *req_buffer;
@@ -34,9 +46,22 @@ void *handle_client(void *arg)
 
 int main()
 {
-    int server_socket, client_socket;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset); // Pin to core 0
+
+    if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpuset) == -1)
+    {
+        perror("sched_setaffinity");
+        // Handle error
+    }
+    else
+    {
+        printf("Process %d pinned to core 1.\n", getpid());
+    }
+
+    int server_socket;
+    struct sockaddr_in server_addr;
 
     // CREATE
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -77,29 +102,12 @@ int main()
         // Phase 1: Accept multiple connections quickly
         int accepted_sockets[MAX_PENDING_ACCEPTS];
         int accept_count = 0;
-        struct timeval start_time, current_time;
-
-        gettimeofday(&start_time, NULL);
 
         while (accept_count < MAX_PENDING_ACCEPTS)
         {
-            // Set timeout
-            fd_set read_fds;                  // set of fds to monitor
-            FD_ZERO(&read_fds);               // clear the set
-            FD_SET(server_socket, &read_fds); // add server fd to the set
-
-            struct timeval timeout = {
-                .tv_sec = 0,
-                .tv_usec = (ACCEPT_TIMEOUT_MS * 1000)};
-
-            // Wait for activity with timeout
-            int ready = select(server_socket + 1, &read_fds, NULL, NULL, &timeout);
-            if (ready <= 0)
-            {
-                break; // Timeout or error
-            }
-
-            client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
             if (client_socket < 0)
             {
                 if (errno == EWOULDBLOCK || errno == EAGAIN)
@@ -113,15 +121,6 @@ int main()
 
             // printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
             accepted_sockets[accept_count++] = client_socket;
-
-            // Check elapsed time
-            gettimeofday(&current_time, NULL);
-            long elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 +
-                              (current_time.tv_usec - start_time.tv_usec) / 1000;
-            if (elapsed_ms >= ACCEPT_TIMEOUT_MS)
-            {
-                break;
-            }
         }
         // Phase 2: Handle accepted connections
         for (int i = 0; i < accept_count; i++)
