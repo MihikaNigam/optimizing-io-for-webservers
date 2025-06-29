@@ -1,15 +1,11 @@
 # optimizing-io-for-webservers
-This research project aims to optimize input output requests and analyze performance on existing webservers.
+This research project aims to optimize http webservers and analyze performance on existing webservers.
+
+Uses IO_URING
 
 
-A Server at minimum needs to:
+Client Sends HTTP Request -> packets arrive at NIC -> NIC triggers an interrupt to notify kernel -> the driver collects these packets -> req passes thru tcp/ip stacks-> network management places queue is req’s socket buffer -> webserver calls recv to read the req -> kernel returns the HTTP request data to the user-space
 
-- Create a socket
-- Bind the socket to an address
-- Listen on the address
-- Block on Accept until a connection is made
-- Read on the connected socket
-- Figure out how to respond
-- Write back on the connected socket
-- Close the connection
-- Go back to blocking on Accept
+![image](https://github.com/user-attachments/assets/11830be2-6e7a-4082-9d58-cde26bd4c22c)
+
+
